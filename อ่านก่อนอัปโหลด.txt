@@ -1,1 +1,7 @@
-AgriData AI เวอร์ชันเพิ่มคำอธิบายผลผลิตต่อไร่ทุกคำตอบ\n\nแตก ZIP แล้วอัปโหลด app.py, requirements.txt, data.csv, province_data.csv ทับไฟล์เดิมใน root ของ GitHub repository agridata-ai กด Commit changes และรีเฟรช Streamlit\n\nระบบแสดงนิยามและสูตรผลผลิตต่อไร่ทุกคำตอบ (รวมกรณีไม่พบข้อมูล) พร้อมข้อควรระวังข้อมูลประมาณการจากค่าเฉลี่ยระดับจังหวัด สศก. ไม่มีการแก้ไขตัวเลขฐานข้อมูล\n
+AgriData AI V2.0
+อัปโหลด app.py, requirements.txt, data.csv, province_data.csv ไปยัง GitHub repository root แล้ว Commit changes
+เปิด Streamlit รอ deploy / refresh
+ใช้ tabs Chat / Dashboard / ตรวจสอบคุณภาพ / ข้อมูลต้นฉบับ
+การจัดอันดับข้ามปีถูกระงับเมื่อมีหลายปี โปรดระบุปี
+Secrets เดิมใช้งานได้ ไม่มีการเปลี่ยน API Key
+ข้อมูลตัวเลขจากเวอร์ชันก่อนหน้า ไม่ได้ยืนยันกลับ PDF สศก. ทุกค่า
