@@ -103,6 +103,44 @@ def try_ai(question, df, level):
     except Exception:
         return {}
 
+def evidence_note(rows, level):
+    """Explain observed district figures vs estimates using province-wide mean yield."""
+    if level != "อำเภอ" or rows is None or rows.empty:
+        return ""
+    status = rows["สถานะข้อมูล"].fillna("").astype(str) if "สถานะข้อมูล" in rows else pd.Series([], dtype=str)
+    method = rows["วิธีได้มา"].fillna("").astype(str) if "วิธีได้มา" in rows else pd.Series([], dtype=str)
+    estimated = status.str.contains("พื้นที่เก็บเกี่ยวอำเภอ × ผลผลิตเฉลี่ยจังหวัด", regex=False) | method.str.contains("ผลผลิตเฉลี่ยจังหวัด สศก.", regex=False)
+    derived = status.str.contains("คำนวณรวมจากข้อมูลจริงรายอำเภอ", regex=False)
+    fixed = status.str.contains("อัตราผลผลิตคงที่", regex=False)
+    direct = ~(estimated | derived | fixed)
+    notes = ["**คำอธิบายที่มาของตัวเลขรายอำเภอ** (ดูคอลัมน์ ‘คำอธิบายข้อมูล’ ประกอบ)"]
+    if direct.any(): notes.append(f"• ข้อมูลรายอำเภอจากเอกสาร: {int(direct.sum())} รายการ — เป็นค่าที่ระบุในเอกสารระดับอำเภอหรือหน่วยงานที่เกี่ยวข้อง ไม่ได้หมายความว่า สศก. รับรองค่ารายอำเภอทุกค่า")
+    if derived.any(): notes.append(f"• ผลรวมจากรายการรายอำเภอ: {int(derived.sum())} รายการ — คำนวณรวมรายการย่อยที่มีข้อมูลระดับอำเภอ")
+    if estimated.any(): notes.append(f"• **ผลผลิตรายอำเภอประมาณการโดยใช้อัตราผลผลิตเฉลี่ยระดับจังหวัดของ สศก.: {int(estimated.sum())} รายการ** — นำพื้นที่เก็บเกี่ยวรายอำเภอ × ผลผลิตเฉลี่ยจังหวัด ÷ 1,000 **ไม่ใช่ผลผลิตรายอำเภอที่ สศก. รายงานโดยตรง และไม่ใช่การนำยอดรวมจังหวัดมาใส่แทนรายอำเภอ**")
+    if fixed.any(): notes.append(f"• ผลผลิตคำนวณตามอัตราคงที่ของรายงานท้องถิ่น: {int(fixed.sum())} รายการ — เป็นค่าคำนวณ ไม่ใช่ผลสำรวจผลผลิตจริง")
+    notes.append("⚠️ รายการประมาณการไม่ควรใช้จัดอันดับ/อ้างว่าเป็นผลผลิตจริงรายอำเภอโดยไม่ระบุวิธีประมาณ; โปรดตรวจปีข้อมูลและหลักฐานก่อนใช้ในรายงานราชการ")
+    return "\n\n" + "\n\n".join(notes)
+
+def add_explanation(df, level):
+    df = df.copy()
+    if level == "จังหวัด":
+        df["คำอธิบายข้อมูล"] = "ข้อมูลสรุประดับจังหวัดจากเอกสารอ้างอิง สศก. (ไม่ใช่ตัวเลขระดับอำเภอ)"
+        return df
+    if "สถานะข้อมูล" not in df: return df
+    status = df["สถานะข้อมูล"].fillna("").astype(str)
+    descriptions = []
+    for val in status:
+        if "พื้นที่เก็บเกี่ยวอำเภอ × ผลผลิตเฉลี่ยจังหวัด" in val:
+            descriptions.append("ประมาณการระดับอำเภอจากพื้นที่เก็บเกี่ยวอำเภอ × ผลผลิตเฉลี่ยระดับจังหวัด สศก. ÷ 1,000; ไม่ใช่ตัวเลขผลผลิตรายอำเภอที่ สศก. รายงานโดยตรง")
+        elif "คำนวณรวมจากข้อมูลจริงรายอำเภอ" in val:
+            descriptions.append("คำนวณรวมจากรายการข้อมูลจริงในระดับอำเภอ (โปรดดูวิธีได้มา)")
+        elif "อัตราผลผลิตคงที่" in val:
+            descriptions.append("ค่าคำนวณตามอัตราผลผลิตคงที่จากรายงานท้องถิ่น ไม่ใช่ผลผลิตที่สำรวจโดยตรง")
+        else:
+            descriptions.append("ผลผลิตระดับอำเภอตามเอกสารอ้างอิง โปรดตรวจปีและประเภทหลักฐาน")
+    df["คำอธิบายข้อมูล"] = descriptions
+    return df
+
 def answer(question, district_df, province_df):
     level = "อำเภอ" if "อำเภอ" in question or "รายอำเภอ" in question else "จังหวัด"
     if "จังหวัด" in question and "อำเภอ" in question:
@@ -153,7 +191,8 @@ def answer(question, district_df, province_df):
     if valid.empty:
         return f"มีรายการที่ตรงกับคำถาม แต่ไม่มีตัวเลข {metric} ในไฟล์ต้นทาง", None, None
     # Never add separate years or crops by default. Preserve individual records.
-    cols = [c for c in ["จังหวัด", "อำเภอ", "พืช", "ปี", "เนื้อที่เก็บเกี่ยว (ไร่)", "ผลผลิต (ตัน)", "ผลผลิตต่อไร่ (กก./ไร่)", "สถานะข้อมูล", "วิธีได้มา", "ประเภทหลักฐาน", "แหล่งข้อมูล", "อ้างอิง สศก.", "ลิงก์อ้างอิง", "URL สศก.", "ข้อจำกัด", "ไฟล์ต้นฉบับ"] if c in valid]
+    valid = add_explanation(valid, level)
+    cols = [c for c in ["คำอธิบายข้อมูล", "จังหวัด", "อำเภอ", "พืช", "ปี", "เนื้อที่เก็บเกี่ยว (ไร่)", "ผลผลิต (ตัน)", "ผลผลิตต่อไร่ (กก./ไร่)", "สถานะข้อมูล", "วิธีได้มา", "ประเภทหลักฐาน", "แหล่งข้อมูล", "อ้างอิง สศก.", "ลิงก์อ้างอิง", "URL สศก.", "ข้อจำกัด", "ไฟล์ต้นฉบับ"] if c in valid]
     result = valid[cols].copy()
     if "อันดับ" in question or "มากที่สุด" in question or "สูงสุด" in question:
         result = result.sort_values(metric, ascending=True if "น้อยที่สุด" in question else False)
@@ -166,7 +205,8 @@ def answer(question, district_df, province_df):
     header = f"พบ **{len(valid):,} รายการ** ระดับ**{level}** | ปีข้อมูล: {', '.join(years)}"
     if shown:
         header += "\n\nเงื่อนไข: " + " · ".join(shown)
-    header += "\n\nแสดงค่าจากรายการข้อมูลต้นฉบับ **ไม่รวมยอดข้ามปี/ข้ามพืช และไม่ใช้ยอดจังหวัดแทนข้อมูลอำเภอ**"
+    header += "\n\nแสดงค่าตามรายการในฐานข้อมูล ไม่รวมยอดข้ามปี/ข้ามพืช และไม่ใช้ยอดรวมจังหวัดแทนยอดอำเภอ"
+    header += evidence_note(valid, level)
     if len(years) > 1:
         header += "\n\n⚠️ รายการอาจมีปีข้อมูลต่างกัน ไม่ควรใช้จัดอันดับเปรียบเทียบโดยตรงจนกว่าจะเลือกปีเดียวกัน"
     return header, result, metric
@@ -222,8 +262,16 @@ with st.sidebar:
     st.download_button("⬇️ ดาวน์โหลดรายการที่กรอง", filtered.to_csv(index=False).encode("utf-8-sig"), "filtered_agri.csv", "text/csv")
 with st.expander("📋 ดูข้อมูลที่โหลดจริงจาก GitHub"):
     view = st.radio("ชุดข้อมูล", [x for x,y in [("อำเภอ",district),("จังหวัด",province)] if y is not None], horizontal=True)
-    display_table(district if view == "อำเภอ" else province, "source_data")
-st.info("หากถาม 'อำเภอ' จะใช้ข้อมูลรายอำเภอ หากถาม 'จังหวัด' จะใช้ยอดจังหวัดจาก สศก. ไม่บวกรวมยอดอำเภอแทน")
+    display_table(add_explanation(district if view == "อำเภอ" else province, view), "source_data")
+st.info("ข้อมูลระดับจังหวัดใช้ยอดจังหวัดตามเอกสารอ้างอิง สศก. ส่วนข้อมูลรายอำเภอมีทั้งค่าที่รายงานจริง ค่ารวมจากข้อมูลย่อย และ **ค่าประมาณการโดยใช้อัตราผลผลิตเฉลี่ยจังหวัด** ซึ่งจะแยกคำอธิบายให้ชัดเจน")
+with st.expander("ℹ️ ความหมายของผลผลิตรายอำเภอที่อ้างอิงข้อมูล สศก."):
+    st.markdown("""**ข้อความที่ควรใช้อธิบาย:** ‘ผลผลิตรายอำเภอประมาณการจากพื้นที่เก็บเกี่ยวรายอำเภอ โดยใช้อัตราผลผลิตเฉลี่ยระดับจังหวัดของสำนักงานเศรษฐกิจการเกษตร (สศก.)’
+
+วิธีคำนวณ: **พื้นที่เก็บเกี่ยวรายอำเภอ (ไร่) × ผลผลิตเฉลี่ยระดับจังหวัด (กก./ไร่) ÷ 1,000 = ผลผลิตประมาณการรายอำเภอ (ตัน)**
+
+ตัวเลขนี้ **ไม่ใช่ข้อมูลผลผลิตรายอำเภอที่ สศก. เผยแพร่โดยตรง** และ **ไม่ได้ใช้ยอดผลผลิตรวมของจังหวัดมาแทนยอดรายอำเภอ** แต่เป็นการประมาณการด้วยอัตราเฉลี่ยจังหวัด ซึ่งอาจไม่สะท้อนความแตกต่างของผลผลิตจริงในแต่ละอำเภอ
+
+บางรายการมีผลผลิตรายอำเภอจากเอกสารต้นทางจริง หรือคำนวณรวมจากรายการย่อย จึงต้องดู ‘สถานะข้อมูล’ ‘วิธีได้มา’ ‘ประเภทหลักฐาน’ และ ‘คำอธิบายข้อมูล’ ของแต่ละแถวก่อนอ้างอิง""")
 st.caption("ตัวอย่าง: 'ข้าวนาปีจังหวัดกาฬสินธุ์ปี 2567' · 'อันดับ 5 อำเภอผลผลิตข้าวนาปีสูงสุดในขอนแก่นปี 2567' · 'จังหวัดอุดรธานีมีผลผลิตอ้อยโรงงานเท่าไร'")
 if not secret("GEMINI_API_KEY"):
     st.caption("ยังไม่ได้ใส่ GEMINI_API_KEY — ถามคำถามแบบระบุจังหวัด/อำเภอ/พืช/ปีได้โดยไม่ใช้ AI")
