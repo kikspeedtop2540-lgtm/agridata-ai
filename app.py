@@ -1,4 +1,4 @@
-"""AgriData AI V3.4 — reliable eight-province agricultural search.
+"""AgriData AI V3.4.2 — reliable eight-province agricultural search.
 
 Data originate from the eight supplied original workbooks. No LLM is allowed to invent
 statistics. Province yields are OAE provincial observations; district yield is only
@@ -339,20 +339,63 @@ else:
     st.markdown(f"<div class='ag-info'>📚 <b>ที่มาผลผลิตต่อไร่:</b> สศก. · สถิติการเกษตรของประเทศไทย ปี 2568 · "
                 f"{', '.join(current['อ้างอิงตาราง/หน้า'].str.replace(r'^\[\d+\] ', '', regex=True).unique().tolist())} · "
                 "เป็นค่า กก./ไร่ ระดับจังหวัดตามเอกสาร ไม่ใช่ค่าเฉลี่ยของหลายจังหวัดที่คำนวณขึ้นใหม่</div>", unsafe_allow_html=True)
+    # Keep plot column keys ASCII: Altair/Vega interprets '.' and brackets in Thai
+    # metric headings (e.g. 'กก./ไร่') as nested field access, yielding EMPTY bars.
+    # The actual database values remain unchanged; this is presentation-only.
+    all_provinces = set(province[PROV].dropna().astype(str).unique())
+    missing_cities = sorted(all_provinces - set(current[PROV].astype(str).unique()))
+    if missing_cities:
+        st.caption("ℹ️ จังหวัดที่ยังไม่มีรายการพืชนี้ในตารางสรุประดับจังหวัด: "
+                   + ", ".join(missing_cities)
+                   + " (ไม่ใช่ข้อสรุปว่าไม่มีการปลูก)")
     if same_year:
         st.markdown("#### 🏆 เปรียบเทียบผลผลิตต่อไร่ (กก./ไร่)")
-        ranked = current.sort_values(PYIELD,ascending=False).copy()
-        ranked["ป้ายตัวเลข"] = ranked[PYIELD].map(lambda x:f"{x:,.2f}")
-        chart = alt.Chart(ranked).mark_bar(color="#278765", cornerRadiusEnd=6).encode(
-            y=alt.Y("จังหวัด:N", sort=alt.SortField(field=PYIELD,order="descending"), title=None, axis=alt.Axis(labelFontSize=15,labelLimit=200)),
-            x=alt.X("ผลผลิตต่อไร่ (กก./ไร่):Q",title="กิโลกรัมต่อไร่ (กก./ไร่)",axis=alt.Axis(labelFontSize=12)),
-            tooltip=[alt.Tooltip("จังหวัด:N"),alt.Tooltip("พืช:N"),alt.Tooltip("ปีสถิติ:N"),alt.Tooltip("ผลผลิตต่อไร่ (กก./ไร่):Q",format=",.2f")]
-        ).properties(height=max(110,55*len(ranked)))
-        labels = alt.Chart(ranked).mark_text(align="left",dx=7,fontSize=14,fontWeight="bold",color="#1c5b41").encode(
-            y=alt.Y("จังหวัด:N",sort=alt.SortField(field=PYIELD,order="descending")),
-            x=alt.X("ผลผลิตต่อไร่ (กก./ไร่):Q"),text="ป้ายตัวเลข:N"
-        )
-        st.altair_chart((chart+labels).configure_axis(gridColor="#eff3f0",domain=False),use_container_width=True)
+        ranked = current[[PROV, CROP, "ปีสถิติ", PYIELD]].copy()
+        ranked[PYIELD] = pd.to_numeric(ranked[PYIELD], errors="coerce")
+        ranked = ranked.loc[ranked[PYIELD].notna() & (ranked[PYIELD] > 0)].copy()
+        if ranked.empty:
+            st.warning("ไม่มีค่าผลผลิตต่อไร่ที่เป็นตัวเลขมากกว่า 0 สำหรับวาดกราฟ โปรดดูตารางข้อมูลด้านล่าง")
+        else:
+            # Use only unambiguous ASCII names inside Vega-Lite expressions.
+            plot = pd.DataFrame({
+                "province_name": ranked[PROV].astype(str),
+                "crop_name": ranked[CROP].astype(str),
+                "stat_year": ranked["ปีสถิติ"].astype(str),
+                "yield_kg_rai": ranked[PYIELD].astype(float),
+            }).sort_values("yield_kg_rai", ascending=False)
+            plot["value_label"] = plot["yield_kg_rai"].map(lambda n: f"{n:,.2f}")
+            ordered = plot["province_name"].tolist()
+            max_yield = float(plot["yield_kg_rai"].max())
+            # A little right padding leaves room for a value label at the end of each bar.
+            bars = alt.Chart(plot).mark_bar(color="#2aa576", cornerRadiusEnd=5).encode(
+                y=alt.Y("province_name:N", sort=ordered, title=None,
+                        axis=alt.Axis(labelFontSize=15, labelLimit=230)),
+                x=alt.X("yield_kg_rai:Q", title="ผลผลิตต่อไร่ (กก./ไร่)",
+                        scale=alt.Scale(domain=[0, max_yield * 1.25]),
+                        axis=alt.Axis(labelFontSize=13, format=",.0f")),
+                tooltip=[
+                    alt.Tooltip("province_name:N", title="จังหวัด"),
+                    alt.Tooltip("crop_name:N", title="ชนิดพืช"),
+                    alt.Tooltip("stat_year:N", title="ปีสถิติ"),
+                    alt.Tooltip("yield_kg_rai:Q", title="กก./ไร่", format=",.2f"),
+                ],
+            ).properties(height=max(130, 49 * len(plot)))
+            labels = alt.Chart(plot).mark_text(
+                align="left", baseline="middle", dx=7, fontSize=14,
+                fontWeight="bold", color="#22bc89"
+            ).encode(
+                y=alt.Y("province_name:N", sort=ordered),
+                x=alt.X("yield_kg_rai:Q"),
+                text=alt.Text("value_label:N"),
+            )
+            try:
+                st.altair_chart((bars + labels).configure_axis(
+                    domain=False, gridColor="#a2aaa526"),
+                    use_container_width=True)
+            except Exception:
+                st.warning("กราฟละเอียดขัดข้องชั่วคราว จะแสดงกราฟพื้นฐานและตารางข้อมูลแทน")
+                st.bar_chart(plot.set_index("province_name")[["yield_kg_rai"]],
+                             horizontal=True, use_container_width=True)
     shown_cols=[PROV,CROP,"ปีสถิติ",PYIELD,PCOUNT,PAREA,"ที่มาสั้น","ลิงก์ สศก."]
     st.markdown("#### 📋 ตารางตัวเลขพร้อมแหล่งอ้างอิง")
     st.dataframe(pretty(current.sort_values(PYIELD,ascending=False),shown_cols),hide_index=True,use_container_width=True)
