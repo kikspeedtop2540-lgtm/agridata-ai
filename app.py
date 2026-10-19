@@ -1,4 +1,4 @@
-"""AgriData AI: local CSV, two geographic levels, transparent calculations.
+"""AgriData AI V3.1: chat-first home + lower yield dashboard, local CSV.
 Upload app.py + requirements.txt + data.csv + province_data.csv to GitHub root.
 """
 import hmac
@@ -12,7 +12,7 @@ import pandas as pd
 import altair as alt
 import streamlit as st
 
-st.set_page_config(page_title="AgriData AI", page_icon="🌾", layout="wide")
+st.set_page_config(page_title="AgriData AI | ถามข้อมูลการเกษตร", page_icon="🌾", layout="wide", initial_sidebar_state="collapsed")
 BASE = Path(__file__).resolve().parent
 FILES = {"อำเภอ": "data.csv", "จังหวัด": "province_data.csv"}
 NUMBERS = {"ผลผลิต (ตัน)": "ผลผลิต (ตัน)", "เนื้อที่เก็บเกี่ยว (ไร่)": "เนื้อที่เก็บเกี่ยว (ไร่)", "ผลผลิตต่อไร่ (กก./ไร่)": "ผลผลิตต่อไร่ (กก./ไร่)"}
@@ -403,7 +403,12 @@ def answer(question, district_df, province_df):
     header += "\n\nแสดงค่าตามรายการในฐานข้อมูล ไม่รวมยอดข้ามปี/ข้ามพืช และไม่ใช้ยอดรวมจังหวัดแทนยอดอำเภอ"
     if comparison_warning:
         header += "\n\n" + comparison_warning
-    header += evidence_note(valid, level)
+    if level == "อำเภอ":
+        short_sources = valid.apply(lambda row: source_short(row, level), axis=1).dropna().unique().tolist()
+        if short_sources:
+            header += "\n\n📚 **ที่มา:** " + " · ".join(str(x) for x in short_sources[:2])
+            if len(short_sources) > 2:
+                header += " (ดูที่มาเพิ่มเติมในตาราง)"
     if len(years) > 1:
         header += "\n\n⚠️ รายการอาจมีปีข้อมูลต่างกัน ไม่ควรใช้จัดอันดับเปรียบเทียบโดยตรงจนกว่าจะเลือกปีเดียวกัน"
     return header, result, metric
@@ -570,7 +575,7 @@ def render_metric_cards(stats, area_count, level):
     st.markdown(html_cards, unsafe_allow_html=True)
 
 
-def plot_ranking(frame, metric, title, height_step=33, max_rows=12):
+def plot_ranking(frame, metric, title, height_step=42, max_rows=12):
     plot = frame.dropna(subset=[metric]).copy()
     if plot.empty:
         st.info(f"ยังไม่มีตัวเลข {metric} สำหรับตัวกรองที่เลือก")
@@ -583,11 +588,11 @@ def plot_ranking(frame, metric, title, height_step=33, max_rows=12):
            alt.Tooltip("ที่มา (สั้น):N", title="ที่มา")]
     bars = alt.Chart(plot).mark_bar(cornerRadiusEnd=6, size=19, color="#169675").encode(
         y=alt.Y("พื้นที่แสดง:N", sort="-x", title=None,
-                axis=alt.Axis(labelLimit=240, labelFontSize=12, labelPadding=7)),
+                axis=alt.Axis(labelLimit=260, labelFontSize=15, labelPadding=10)),
         x=alt.X("ตัวเลข:Q", title=metric, axis=alt.Axis(format=",.0f", gridColor="#e5ece8"),
                 scale=alt.Scale(zero=True)), tooltip=tip,
     )
-    st.altair_chart(bars.properties(height=min(480, max(230, len(plot)*height_step)), title=title), use_container_width=True)
+    st.altair_chart(bars.properties(height=min(480, max(260, len(plot)*height_step)), title=title), use_container_width=True)
     if len(frame.dropna(subset=[metric])) > max_rows:
         st.caption(f"กราฟแสดงสูงสุด {max_rows} อันดับ · ตารางด้านล่างมีข้อมูลครบ")
 
@@ -595,8 +600,8 @@ def plot_ranking(frame, metric, title, height_step=33, max_rows=12):
 def dashboard(district, province):
     """V3 homepage: one crop & one exact year per comparison; provenance in each row."""
     st.markdown('<div class="agri-eyebrow">AGRICULTURAL DATA INTELLIGENCE</div>', unsafe_allow_html=True)
-    st.markdown('### 🌾 ภาพรวมผลผลิตพืชเศรษฐกิจ')
-    st.caption("เน้นผลผลิตต่อไร่เพื่อเปรียบเทียบประสิทธิภาพการผลิต · เลือกพืชและปีเดียวกันก่อนจัดอันดับ")
+    st.markdown('## 📊 Dashboard ผลผลิตพืชเศรษฐกิจ')
+    st.caption("เจาะลึกผลผลิตต่อไร่ (กก./ไร่) พร้อมปีและแหล่งอ้างอิง · เลือกพืชและปีเดียวกันเพื่อเปรียบเทียบ")
     sets = {name:df for name,df in (("จังหวัด",province),("อำเภอ",district)) if df is not None and not df.empty}
     if not sets:
         st.error("ไม่พบข้อมูลสำหรับ Dashboard")
@@ -714,98 +719,212 @@ def dashboard(district, province):
         st.markdown("**ระดับอำเภอ:** คำนวณ กก./ไร่ ได้เมื่อมีทั้งผลผลิตและพื้นที่เก็บเกี่ยวในปีที่แสดง บางรายการใช้ผลผลิตเฉลี่ยจังหวัดในการประมาณการ จึงต้องดูที่มาของแต่ละแถว")
         st.markdown("**ข้อมูลที่ขาด:** ช่องว่างหมายถึงไม่มีข้อมูลที่เพียงพอ ไม่ใช่ศูนย์ และไม่ควรตีความว่าผลผลิตต่อไร่ของอำเภอใดเท่ากับค่าเฉลี่ยจังหวัดโดยอัตโนมัติ")
 
+# --- V3.1: conversational assistant first, analysis dashboard immediately below ---
+
+def handle_user_question(question, district_data, province_data):
+    if "chat" not in st.session_state:
+        st.session_state.chat = []
+    if "dialog_context" not in st.session_state:
+        st.session_state.dialog_context = {}
+    st.session_state.chat.append({"role": "user", "text": question})
+    resolved, followup, context = build_conversational_query(
+        question, st.session_state.dialog_context, district_data, province_data
+    )
+    st.session_state.dialog_context = context
+    if followup is not None:
+        reply, table, metric = followup, None, None
+    elif context.get("rice_both") and rice_is_generic(resolved):
+        reply, table, metric = answer_both_rice(resolved, district_data, province_data)
+    elif context.get("rice_both") and not context.get("crop") and not any(
+        x in question for x in ("นาปี", "นาปรัง")
+    ):
+        reply, table, metric = answer_both_rice(resolved + " ข้าว", district_data, province_data)
+    else:
+        reply, table, metric = answer(resolved, district_data, province_data)
+    st.session_state.chat.append({"role": "assistant", "text": with_yield_note(reply, table), "table": table})
+
+
+def show_chat(district_data, province_data):
+    st.markdown('<div class="agri-section-label">01 / ASK AGRI</div>', unsafe_allow_html=True)
+    st.markdown('## 💬 ถามข้อมูลพืชเศรษฐกิจได้เลย')
+    st.markdown('<p class="agri-subtitle">พิมพ์คำถามสั้น ๆ ได้เหมือนคุยกับเจ้าหน้าที่ เช่น “อ้อยจังหวัดขอนแก่น” หรือ “ขอรายอำเภอด้วย”</p>', unsafe_allow_html=True)
+    if "chat" not in st.session_state:
+        st.session_state.chat = []
+    if "dialog_context" not in st.session_state:
+        st.session_state.dialog_context = {}
+
+    examples = [
+        ("🌾 ข้าวขอนแก่น", "ข้าวจังหวัดขอนแก่น"),
+        ("🌱 อ้อยอุดรธานี", "ผลผลิตอ้อยจังหวัดอุดรธานี"),
+        ("📏 ผลผลิตต่อไร่", "ผลผลิตต่อไร่ข้าวนาปีจังหวัดขอนแก่น"),
+        ("📍 รายอำเภอ", "ข้าวนาปีรายอำเภอจังหวัดกาฬสินธุ์"),
+    ]
+    # Two rows of large, easy-to-tap suggestion buttons remain readable on phones.
+    preset = None
+    for start in (0, 2):
+        suggestion_cols = st.columns(2)
+        for offset, (label, example_question) in enumerate(examples[start:start + 2]):
+            with suggestion_cols[offset]:
+                if st.button(label, key=f"chat_example_{start + offset}", use_container_width=True):
+                    preset = example_question
+
+    with st.container(height=500, border=True, key="agri_chat_history"):
+        if not st.session_state.chat:
+            st.markdown("#### 👋 สวัสดีครับ ยินดีต้อนรับสู่ AgriData AI")
+            st.markdown("ถามข้อมูลการเกษตรได้ทั้ง **ระดับจังหวัด** และ **รายอำเภอ** จากฐานข้อมูล 8 จังหวัด")
+            st.markdown("**คำถามตัวอย่าง**: _ผลผลิตอ้อยขอนแก่นเป็นเท่าไหร่?_  หรือ  _อำเภอไหนมีผลผลิตต่อไร่สูงที่สุด?_ ")
+            st.info("📚 คำตอบอ้างอิงข้อมูลที่มีอยู่ในฐานข้อมูล พร้อมปีและที่มาของตัวเลข")
+        else:
+            last_index = len(st.session_state.chat) - 1
+            for idx, msg in enumerate(st.session_state.chat):
+                with st.chat_message(msg["role"]):
+                    st.markdown(msg["text"])
+                    data = msg.get("table")
+                    if data is not None and not data.empty:
+                        expanded = idx == last_index
+                        with st.expander(f"📊 ตารางข้อมูล {len(data):,} รายการ และดาวน์โหลด", expanded=expanded):
+                            display_table(data, f"home_chat_{idx}")
+    # Explicit nested container keeps the composer INLINE, before the Dashboard,
+    # instead of Streamlit's normal bottom-of-page floating chat composer.
+    with st.container(key="agri_chat_composer"):
+        question = st.chat_input("ถามข้อมูลได้เลย เช่น ผลผลิตต่อไร่อ้อยจังหวัดขอนแก่น…", key="agri_chat_question")
+    left, right = st.columns([3.5, 1])
+    with left:
+        st.caption("💡 ถามต่อได้โดยไม่ต้องพิมพ์จังหวัดหรือชื่อพืชซ้ำ")
+    with right:
+        if st.button("🧹 ล้างแชท", key="clear_chat_home", use_container_width=True):
+            st.session_state.chat = []
+            st.session_state.dialog_context = {}
+            st.rerun()
+    if not secret("GEMINI_API_KEY"):
+        st.caption("ℹ️ ระบบค้นหาจากฐานข้อมูลได้แม้ยังไม่เชื่อม Gemini; คำถามซับซ้อนอาจมีข้อจำกัด")
+    chosen = preset or question
+    if chosen and str(chosen).strip():
+        if district_data is None or province_data is None:
+            st.error("กรุณาอัปโหลด data.csv และ province_data.csv เพื่อเปิดการสนทนา")
+        else:
+            handle_user_question(str(chosen).strip(), district_data, province_data)
+            st.rerun()
+
+
 st.markdown("""<style>
-.block-container {padding-top:1.25rem; max-width:1480px;}
-.agri-hero {border:1px solid #225e51; background:linear-gradient(112deg,#103f35 0%,#195d49 60%,#287052 100%); border-radius:19px; padding:28px 32px; margin-bottom:18px; color:#f8fff9;}
-.agri-title {font-size:clamp(1.75rem,3vw,2.7rem); font-weight:800; margin:0; letter-spacing:-.025em; line-height:1.2;}
-.agri-lead {color:#d3efe1; margin:10px 0 0; font-size:1rem;}
-.agri-eyebrow {font-size:0.69rem;font-weight:800;letter-spacing:.19em;color:#347e62;margin:4px 0 8px;}
-.agri-kpi-grid {display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; margin:13px 0 12px;}
-.agri-kpi {border-radius:14px;border:1px solid #d9e6dc; background:#fbfefa; padding:18px 15px 15px; min-width:0;}
-.agri-kpi-main {background:#e2f5e9;border:1px solid #85ba9b;}
-.agri-kpi-label {font-size:.81rem; font-weight:700; color:#415d4a;}
-.agri-kpi-value {font-weight:800; font-variant-numeric:tabular-nums; color:#194b36; font-size:clamp(1.25rem,2.2vw,2rem); margin:7px 0 5px;white-space:nowrap;}
-.agri-kpi-value span {font-size:.72rem;font-weight:600;margin-left:5px;}
-.agri-kpi-note {font-size:.72rem;color:#4e6b57;line-height:1.4;}
-@media (max-width:800px) {.agri-kpi-grid {grid-template-columns:repeat(2,minmax(0,1fr));}}
-@media (max-width:460px) {.agri-kpi-grid {grid-template-columns:1fr 1fr; gap:7px;} .agri-kpi {padding:11px 9px;} .agri-kpi-value {font-size:1.12rem;white-space:normal;} .agri-kpi-note {font-size:.66rem;} .agri-hero {padding:19px 18px;}}
-@media (prefers-color-scheme: dark) {.agri-kpi {background:#1f352b;border-color:#496152;} .agri-kpi-main {background:#284d38;border-color:#6c9b79;} .agri-kpi-label,.agri-kpi-note {color:#c3dbca;} .agri-kpi-value {color:#e9ffec;} .agri-eyebrow {color:#a4e7bd;}}
+@import url('https://fonts.googleapis.com/css2?family=Prompt:wght@400;500;600;700;800&display=swap');
+:root {--agri-green:#17644d;--agri-green-soft:#e7f4ed;--agri-border:#d9e4dd;}
+html, body, [data-testid="stAppViewContainer"], [data-testid="stSidebar"],
+[data-testid="stAppViewContainer"] button, [data-testid="stAppViewContainer"] input,
+[data-testid="stAppViewContainer"] textarea {
+ font-family:'Prompt','Noto Sans Thai',Tahoma,sans-serif !important;
+}
+.block-container {max-width:1320px; padding-top:1.4rem; padding-bottom:5rem;}
+[data-testid="stMarkdownContainer"] p, [data-testid="stMarkdownContainer"] li {
+ font-size:1.075rem; line-height:1.8; letter-spacing:.002em;
+}
+[data-testid="stMarkdownContainer"] h2 {font-size:clamp(1.55rem,2.6vw,2rem); font-weight:750; letter-spacing:-.02em; line-height:1.42;}
+[data-testid="stMarkdownContainer"] h3 {font-size:1.33rem; font-weight:700; line-height:1.55;}
+[data-testid="stWidgetLabel"] p, [data-testid="stSelectbox"] label p, [data-testid="stRadio"] label p {
+ font-size:1.045rem !important; font-weight:600;
+}
+[data-testid="stCaptionContainer"] p, .stCaption p {
+ font-size:.95rem !important; line-height:1.7 !important;
+}
+[data-testid="stButton"] button {min-height:3rem; border-radius:12px; font-size:1.02rem; font-weight:600;}
+[data-testid="stDownloadButton"] button {font-size:1rem; min-height:3rem; border-radius:12px;}
+[data-testid="stChatMessage"] {padding:1.05rem 1.1rem; border-radius:14px;}
+[data-testid="stChatMessage"] p {font-size:1.075rem !important; line-height:1.75 !important;}
+/* Inline message composer above Dashboard, not the bottom-of-viewport sticky composer */
+.st-key-agri_chat_composer [data-testid="stChatInput"] {margin-top:13px; margin-bottom:4px;}
+.st-key-agri_chat_composer textarea {font-size:1.17rem !important; line-height:1.5 !important; min-height:70px !important; padding-top:17px !important;}
+.st-key-agri_chat_composer [data-testid="stChatInput"] > div {border-radius:16px; border-width:2px;}
+.st-key-agri_chat_history {border-radius:18px;}
+.agri-hero {border-radius:22px; padding:28px 32px; margin-bottom:24px;
+ background:linear-gradient(115deg,#0c473a 0%,#166b50 60%,#27856c 100%); color:#fff;
+ box-shadow:0 8px 24px rgba(5,55,35,.12);}
+.agri-title {font-size:clamp(2rem,4vw,3rem);font-weight:800;letter-spacing:-.04em;line-height:1.35;}
+.agri-lead {font-size:clamp(1.03rem,1.8vw,1.23rem);color:#e1f4e9;margin-top:6px;line-height:1.7;}
+.agri-eyebrow, .agri-section-label {font-size:.84rem;font-weight:800;letter-spacing:.14em;color:#1f8668;margin:9px 0 7px;}
+.agri-subtitle {font-size:1.06rem !important;line-height:1.65;color:inherit;opacity:.85;margin:0 0 15px;}
+.agri-dash-spacer {border-top:1px solid var(--agri-border);margin:37px 0 27px;}
+.agri-kpi-grid {display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:13px;margin:16px 0 18px;}
+.agri-kpi {min-width:0;border-radius:16px;border:1px solid #cfe0d4;background:#f7fbf8;padding:19px 16px;}
+.agri-kpi-main {background:linear-gradient(150deg,#d6f1de,#edf9ee);border:2px solid #7db693;}
+.agri-kpi-label {font-size:1rem;font-weight:650;color:#315843;line-height:1.4;}
+.agri-kpi-value {font-weight:800;font-variant-numeric:tabular-nums;color:#16593b;font-size:clamp(1.4rem,2.25vw,2.15rem);margin:9px 0 6px;overflow-wrap:anywhere;}
+.agri-kpi-value span {font-size:.84rem;font-weight:650;white-space:nowrap;}
+.agri-kpi-note {font-size:.88rem;line-height:1.65;color:#52705d;}
+[data-testid="stDataFrame"] {border-radius:12px;overflow:hidden;}
+@media(max-width:920px) {.agri-kpi-grid {grid-template-columns:repeat(2,minmax(0,1fr));}}
+@media(max-width:610px) {
+ .block-container {padding-top:1rem;}
+ .agri-hero {padding:22px 19px;border-radius:16px;}
+ .agri-title {font-size:2rem;}
+ .agri-kpi-grid {gap:8px;}
+ .agri-kpi {padding:13px 11px;}
+ .agri-kpi-value {font-size:1.35rem;}
+ .agri-kpi-label {font-size:.9rem;}
+ .agri-kpi-note {font-size:.8rem;}
+ [data-testid="stButton"] button {font-size:.9rem;}
+}
+@media(prefers-color-scheme:dark) {
+ .agri-kpi {background:#1e352a;border-color:#425d4b;}
+ .agri-kpi-main {background:#234632;border-color:#6fb48b;}
+ .agri-kpi-label,.agri-kpi-note {color:#c2e0ca;}
+ .agri-kpi-value {color:#f0fff2;}
+ .agri-eyebrow,.agri-section-label {color:#9bdab8;}
+ .agri-dash-spacer {border-color:#425c4e;}
+}
 </style>""", unsafe_allow_html=True)
-st.markdown("""<div class="agri-hero"><div class="agri-title">🌾 AgriData AI <span style="font-size:0.36em;vertical-align:middle;opacity:.8">V3.0</span></div><p class="agri-lead">ข้อมูลพืชเศรษฐกิจ 8 จังหวัด · ผลผลิตต่อไร่เป็นหัวใจของการเปรียบเทียบ · ที่มาชัดเจนทุกตัวเลข</p></div>""", unsafe_allow_html=True)
-password=secret("APP_PASSWORD")
+st.markdown("""<div class="agri-hero">
+<div class="agri-title">🌾 AgriData AI <span style="font-size:.34em;vertical-align:middle;opacity:.8;font-weight:600">V3.1</span></div>
+<div class="agri-lead">ผู้ช่วยค้นหาและวิเคราะห์ผลผลิตพืชเศรษฐกิจรายจังหวัดและอำเภอ<br>ถามได้ทันที · ผลผลิตต่อไร่ชัดเจน · พร้อมปีข้อมูลและแหล่งอ้างอิง</div>
+</div>""", unsafe_allow_html=True)
+password = secret("APP_PASSWORD")
 if password and not st.session_state.get("auth"):
     with st.form("login"):
-        value=st.text_input("รหัสผ่าน",type="password")
+        value = st.text_input("รหัสผ่าน", type="password")
         if st.form_submit_button("เข้าสู่ระบบ"):
-            if hmac.compare_digest(value,password):st.session_state.auth=True;st.rerun()
-            else:st.error("รหัสผ่านไม่ถูกต้อง")
+            if hmac.compare_digest(value, password):
+                st.session_state.auth = True
+                st.rerun()
+            else:
+                st.error("รหัสผ่านไม่ถูกต้อง")
     st.stop()
-district=data_for("อำเภอ")
-province=data_for("จังหวัด")
+district = data_for("อำเภอ")
+province = data_for("จังหวัด")
 if district is None and province is None:
     st.error("ไม่พบ data.csv และ province_data.csv ใน GitHub")
     st.stop()
 with st.sidebar:
-    st.header("🗃️ ชุดข้อมูลที่อ่านได้")
-    for level,frame in (("อำเภอ",district),("จังหวัด",province)):
+    st.header("🗃️ ข้อมูลที่มีในระบบ")
+    for level, frame in (("อำเภอ", district), ("จังหวัด", province)):
         if frame is not None:
-            st.metric(level,f"{len(frame):,} รายการ")
+            st.metric(level, f"{len(frame):,} รายการ")
             st.caption(f"{frame['จังหวัด'].nunique()} จังหวัด · {frame['พืช'].nunique()} ชนิดพืช")
     if st.button("🔄 โหลด CSV ใหม่"):
-        load_csv.clear();st.rerun()
-    st.caption("ใช้ไฟล์ CSV ใน GitHub · ไม่มีการแก้ข้อมูลต้นฉบับ")
+        load_csv.clear()
+        st.rerun()
+    st.caption("ฐานข้อมูล CSV จาก GitHub · ตัวเลขต้นฉบับไม่ถูกแก้ไข")
 
-tab_dashboard,tab_chat,tab_quality,tab_source=st.tabs(["🏠 Dashboard · ผลผลิตต่อไร่","💬 ถาม AgriData","🛡️ ตรวจสอบคุณภาพ","📚 ข้อมูลต้นฉบับ"])
-with tab_dashboard:
-    dashboard(district,province)
-    st.info("💬 ต้องการเจาะลึกข้อมูล? ไปที่แท็บ **ถาม AgriData** แล้วพิมพ์คำถามได้เลย")
-with tab_chat:
-    st.markdown("**ตัวอย่าง:** ผลผลิตอ้อยจังหวัดขอนแก่น · ข้าวนาปีรายอำเภอในกาฬสินธุ์ · อันดับอ้อยสูงสุดปี 2567")
-    with st.expander("ℹ️ คำอธิบายผลผลิตต่อไร่และข้อมูลประมาณการ"):
-        st.write("ผลผลิตต่อไร่ คือ ปริมาณผลผลิตเฉลี่ยต่อพื้นที่เก็บเกี่ยว 1 ไร่ (กก./ไร่) คำนวณจากผลผลิตรวม (ตัน) × 1,000 ÷ เนื้อที่เก็บเกี่ยว (ไร่) โดยพื้นที่ต้องมากกว่า 0")
-        st.write("หากข้อมูลรายอำเภอประมาณการโดยใช้ผลผลิตเฉลี่ยระดับจังหวัดของ สศก. ค่า กก./ไร่ อาจเป็นค่าเฉลี่ยระดับจังหวัด ไม่ใช่ข้อมูลวัดจริงของอำเภอนั้น ควรดูปีและแหล่งอ้างอิง")
-    if not secret("GEMINI_API_KEY"):
-        st.info("ยังไม่มี Gemini API Key — ใช้คำถามที่ระบุจังหวัด/อำเภอ/พืช/ปีโดยตรงได้")
-    if "chat" not in st.session_state:st.session_state.chat=[]
-    if st.button("🧹 เริ่มบทสนทนาใหม่", key="reset_chat"):
-        st.session_state.chat=[]
-        st.session_state.dialog_context={}
-        st.rerun()
-    for idx,msg in enumerate(st.session_state.chat):
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["text"])
-            if msg.get("table") is not None:display_table(msg["table"],f"chat_{idx}")
-    q=st.chat_input("พิมพ์คำถามเกี่ยวกับผลผลิตพืชเศรษฐกิจ…")
-    if q:
-        st.session_state.chat.append({"role":"user","text":q})
-        if "dialog_context" not in st.session_state:
-            st.session_state.dialog_context = {}
-        resolved, followup, next_context = build_conversational_query(q, st.session_state.dialog_context, district, province)
-        st.session_state.dialog_context = next_context
-        if followup is not None:
-            reply, table, metric = followup, None, None
-        elif next_context.get("rice_both") and rice_is_generic(resolved):
-            reply, table, metric = answer_both_rice(resolved, district, province)
-        elif next_context.get("rice_both") and not next_context.get("crop") and not any(x in q for x in ("นาปี", "นาปรัง")):
-            reply, table, metric = answer_both_rice(resolved + " ข้าว", district, province)
-        else:
-            reply, table, metric = answer(resolved, district, province)
-        st.session_state.chat.append({"role":"assistant","text":with_yield_note(reply,table),"table":table})
-        st.rerun()
-with tab_quality:
+home_tab, quality_tab, source_tab = st.tabs(["🏠 หน้าแรก · แชทและ Dashboard", "🛡️ ตรวจสอบคุณภาพ", "📚 ข้อมูลต้นฉบับ"])
+with home_tab:
+    show_chat(district, province)
+    st.markdown('<div class="agri-dash-spacer"></div><div class="agri-section-label">02 / DASHBOARD</div>', unsafe_allow_html=True)
+    dashboard(district, province)
+with quality_tab:
     st.subheader("🛡️ ตรวจสอบความครบถ้วนและความสอดคล้อง")
-    all_issues=pd.concat([audit(d,l) for l,d in (("อำเภอ",district),("จังหวัด",province))],ignore_index=True)
-    st.metric("ข้อสังเกตที่ต้องตรวจทาน",len(all_issues))
-    st.caption("เป็นการตรวจสอบเชิงโครงสร้างและการคำนวณ ไม่ใช่การรับรองข้อมูลกับ PDF สศก. ทุกบรรทัด")
-    if all_issues.empty:st.success("ไม่พบประเด็นตามกฎตรวจสอบที่กำหนด")
-    else:display_table(all_issues,"data_quality")
-    st.markdown("**หลักการใช้ข้อมูล:** เลือกปีเดียวกันก่อนจัดอันดับ · แยกข้อมูลประมาณการออกจากข้อมูลรายงานจริง · ไม่รวมผลผลิตต่อไร่ด้วยการบวก · ตรวจสอบเอกสารต้นทางก่อนใช้ราชการ")
-with tab_source:
-    level=st.radio("ชุดข้อมูล",[l for l,d in (("อำเภอ",district),("จังหวัด",province)) if d is not None],horizontal=True)
-    raw=district if level=="อำเภอ" else province
+    all_issues = pd.concat([audit(d, l) for l, d in (("อำเภอ", district), ("จังหวัด", province)) if d is not None], ignore_index=True)
+    st.metric("ข้อสังเกตที่ต้องตรวจทาน", len(all_issues))
+    st.caption("ตรวจสอบโครงสร้างและการคำนวณ ไม่ใช่การรับรองข้อมูลกับ PDF สศก. ทุกบรรทัด")
+    if all_issues.empty:
+        st.success("ไม่พบประเด็นตามกฎตรวจสอบที่กำหนด")
+    else:
+        display_table(all_issues, "data_quality")
+    st.markdown("**หลักการใช้ข้อมูล:** ใช้ปีเดียวกันก่อนจัดอันดับ · แยกค่าประมาณการจากข้อมูลรายงานจริง · ไม่บวกผลผลิตต่อไร่ · ตรวจสอบต้นฉบับก่อนใช้ราชการ")
+with source_tab:
+    level = st.radio("ชุดข้อมูล", [l for l, d in (("อำเภอ", district), ("จังหวัด", province)) if d is not None], horizontal=True)
+    raw = district if level == "อำเภอ" else province
     st.caption(f"ข้อมูลระดับ{level} จำนวน {len(raw):,} รายการ")
-    display_table(add_explanation(raw,level),"source_data")
+    display_table(add_explanation(raw, level), "source_data")
     with st.expander("📘 ความหมายและข้อจำกัด"):
         st.markdown("**ผลผลิตต่อไร่:** ผลผลิต (ตัน) × 1,000 ÷ เนื้อที่เก็บเกี่ยว (ไร่) · แสดงทศนิยม 2 ตำแหน่ง")
-        st.markdown("ข้อมูลจังหวัด: **ข้อมูลสรุประดับจังหวัดจากเอกสารอ้างอิง สศก.**")
-        st.markdown("กรณีรายอำเภอประมาณการจากพื้นที่เก็บเกี่ยวอำเภอ × ผลผลิตเฉลี่ยจังหวัด ควรระบุวิธีคำนวณและปีข้อมูล ไม่ใช่ค่าจากการสำรวจผลผลิตจริงของอำเภอ")
+        st.markdown("**ระดับจังหวัด:** ข้อมูลสรุประดับจังหวัดจากเอกสารอ้างอิง สศก.")
+        st.markdown("**ระดับอำเภอ:** บางรายการประมาณการจากพื้นที่เก็บเกี่ยวอำเภอ × ผลผลิตเฉลี่ยจังหวัด ไม่ใช่ค่าที่สำรวจผลผลิตจริงของอำเภอ")
