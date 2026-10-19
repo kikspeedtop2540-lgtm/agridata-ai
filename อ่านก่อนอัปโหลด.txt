@@ -1,8 +1,1 @@
-AgriData AI แก้ปัญหา: ถามอ้อยต้องแสดงเฉพาะอ้อยโรงงาน
-
-แตก ZIP แล้วอัปโหลดไฟล์ app.py, requirements.txt, data.csv, province_data.csv พร้อมกันผ่าน GitHub > Add file > Upload files > Commit changes
-
-ไม่ต้องแก้ Streamlit Secrets
-
-ตัวอย่างทดสอบ: ผลผลิตอ้อยจังหวัดขอนแก่น / ข้าวนาปีจังหวัดขอนแก่น / มันสำปะหลังจังหวัดอุดรธานี
-หมายเหตุ: ผลลัพธ์ต้องแสดงเฉพาะพืชที่ถาม พร้อมปีอ้างอิงจริง
+AgriData AI เวอร์ชันเพิ่มคำอธิบายผลผลิตต่อไร่ทุกคำตอบ\n\nแตก ZIP แล้วอัปโหลด app.py, requirements.txt, data.csv, province_data.csv ทับไฟล์เดิมใน root ของ GitHub repository agridata-ai กด Commit changes และรีเฟรช Streamlit\n\nระบบแสดงนิยามและสูตรผลผลิตต่อไร่ทุกคำตอบ (รวมกรณีไม่พบข้อมูล) พร้อมข้อควรระวังข้อมูลประมาณการจากค่าเฉลี่ยระดับจังหวัด สศก. ไม่มีการแก้ไขตัวเลขฐานข้อมูล\n
