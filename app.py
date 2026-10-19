@@ -49,6 +49,41 @@ def extract_filter(question, values):
     normalized_question = norm(question)
     return next((item for item in candidates if norm(item) in normalized_question), None)
 
+# Normalize common Thai crop names before using optional AI filters.
+# An explicitly named crop always takes priority; never show all crops if a requested crop is absent.
+CROP_ALIASES = {
+    "อ้อย": ["อ้อยโรงงาน", "อ้อย"],
+    "อ้อยโรงงาน": ["อ้อยโรงงาน", "อ้อย"],
+    "มัน": ["มันสำปะหลังโรงงาน", "มันสำปะหลัง"],
+    "มันสำปะหลัง": ["มันสำปะหลังโรงงาน", "มันสำปะหลัง"],
+    "มันสำปะหลังโรงงาน": ["มันสำปะหลังโรงงาน", "มันสำปะหลัง"],
+    "ยาง": ["ยางพารา"],
+    "ยางพารา": ["ยางพารา"],
+    "ข้าวนาปี": ["ข้าวนาปี"],
+    "นาปี": ["ข้าวนาปี"],
+    "ข้าวนาปรัง": ["ข้าวนาปรัง"],
+    "นาปรัง": ["ข้าวนาปรัง"],
+}
+
+def resolve_crop(question, options):
+    """Return (chosen crop, explicitly_requested). No silent fallback to unrelated crops."""
+    q = re.sub(r"\s+", "", str(question))
+    options_by_norm = {re.sub(r"\s+", "", str(o)): o for o in options}
+    # Longer names first, so 'อ้อยโรงงาน' wins over 'อ้อย' and 'ข้าวนาปรัง' over 'นาปรัง'.
+    for alias in sorted(CROP_ALIASES, key=len, reverse=True):
+        if alias not in q:
+            continue
+        for target in CROP_ALIASES[alias]:
+            key = re.sub(r"\s+", "", target)
+            if key in options_by_norm:
+                return options_by_norm[key], True
+        return None, True
+    # Other exact crop names in this particular data set.
+    direct = extract_filter(question, options)
+    if direct:
+        return direct, True
+    return None, False
+
 def available_year(question, df):
     # Return requested B.E./C.E. year as a text token; source years may be crop seasons such as 2565/2566.
     m = re.search(r"(?<!\d)(25\d{2}|20\d{2})(?!\d)", question)
@@ -155,9 +190,21 @@ def answer(question, district_df, province_df):
         if field not in df:
             continue
         choices = df[field].dropna().astype(str).unique().tolist()
-        chosen = extract_filter(question, choices)
+        if field == "พืช":
+            chosen, explicitly_requested = resolve_crop(question, choices)
+            # If a recognized crop has no corresponding database entry, return an empty result;
+            # never ignore the user's crop filter and display other crops instead.
+            if explicitly_requested and chosen is None:
+                return (f"ไม่พบพืชที่ระบุในฐานข้อมูลระดับ{level}\n\n"
+                        f"พืชที่มี: {', '.join(sorted(choices))}"), None, None
+        else:
+            chosen = extract_filter(question, choices)
         ai_candidate = ai.get(ai_field)
-        if not chosen and ai_candidate in choices:
+        if not chosen and field == "พืช" and not explicitly_requested:
+            # AI can assist for unrecognized crop words, but cannot override explicit filters.
+            if ai_candidate in choices:
+                chosen = ai_candidate
+        elif not chosen and field != "พืช" and ai_candidate in choices:
             chosen = ai_candidate
         if chosen:
             df = df[df[field] == chosen]
