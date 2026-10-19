@@ -27,7 +27,8 @@ def load_csv(file_name, size, modified):
         if field in df:
             df[field] = df[field].fillna("").astype(str).str.strip()
     if "ปี" in df:
-        df["ปี"] = pd.to_numeric(df["ปี"], errors="coerce").astype("Int64")
+        df["ปี"] = df["ปี"].fillna("").astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+        df["ปีเรียงลำดับ"] = pd.to_numeric(df["ปี"].str.extract(r"(25\d{2}|20\d{2})")[0], errors="coerce")
     for field in NUMBERS:
         if field in df:
             df[field] = pd.to_numeric(df[field].astype(str).str.replace(",", "", regex=False), errors="coerce")
@@ -49,14 +50,39 @@ def extract_filter(question, values):
     return next((item for item in candidates if norm(item) in normalized_question), None)
 
 def available_year(question, df):
+    # Return requested B.E./C.E. year as a text token; source years may be crop seasons such as 2565/2566.
     m = re.search(r"(?<!\d)(25\d{2}|20\d{2})(?!\d)", question)
     if not m:
         return None
     y = int(m.group(1))
-    years = pd.to_numeric(df["ปี"], errors="coerce").dropna()
-    if not years.empty and years.min() >= 2400 and y < 2200:
+    if y < 2200 and (df["ปีเรียงลำดับ"].dropna() >= 2400).any():
         y += 543
-    return y
+    return str(y)
+
+def period_matches(period, year):
+    # A season labelled 2565/2566 should match either 2565 or 2566, but not 2567.
+    text = str(period).strip()
+    if text == year:
+        return True
+    parts = re.split(r"[/-]", text)
+    if len(parts) < 2:
+        return False
+    try:
+        first = int(parts[0]); second = int(parts[1])
+        if second < 100:
+            second = (first // 100) * 100 + second
+        return int(year) in (first, second)
+    except ValueError:
+        return False
+
+def no_results(raw, level, question):
+    crops = ', '.join(sorted(raw['พืช'].dropna().astype(str).unique()))
+    years = ', '.join(sorted(raw['ปี'].dropna().astype(str).unique()))
+    return (f"ไม่พบข้อมูลระดับ{level} ที่ตรงครบทุกเงื่อนไข\n\n"
+            f"**ปีที่มีในฐานข้อมูลระดับนี้:** {years}\n\n"
+            f"**พืชที่มี:** {crops}\n\n"
+            "หมายเหตุ: ปีเพาะปลูกอาจเขียนเป็น 2565/2566 หรือ 2560/61 "
+            "ซึ่งไม่ใช่ปีข้อมูล 2567; ลองถามโดยไม่ระบุปี หรือใช้ตัวกรองด้านซ้าย")
 
 def try_ai(question, df, level):
     """AI is optional; it only chooses filters, never produces statistics."""
@@ -101,20 +127,20 @@ def answer(question, district_df, province_df):
     year = available_year(question, raw)
     if year is None and ai.get("year") is not None:
         try:
-            year = int(ai["year"])
+            year = str(int(ai["year"]))
         except (TypeError, ValueError):
             pass
     if year is not None:
-        df = df[df["ปี"] == year]
+        df = df[df["ปี"].apply(lambda x: period_matches(x, year))]
         shown.append(f"ปี: {year}")
     else:
         # Avoid merging unlike year periods; per province/crop choose latest available year.
         keys = ["จังหวัด", "พืช"] + (["อำเภอ"] if level == "อำเภอ" else [])
         if "ย้อนหลัง" not in question and "ทุกปี" not in question and "แนวโน้ม" not in question:
-            df = df[df["ปี"] == df.groupby(keys, dropna=False)["ปี"].transform("max")]
+            df = df[df["ปีเรียงลำดับ"] == df.groupby(keys, dropna=False)["ปีเรียงลำดับ"].transform("max")]
             shown.append("ปีล่าสุดแยกตามรายการ (อาจต่างปีกัน)")
     if df.empty:
-        return "ไม่พบข้อมูลตรงตามเงื่อนไข โปรดดูรายชื่อพืช/ปีในตัวกรองด้านซ้าย", None, None
+        return no_results(raw, level, question), None, None
     if "พื้นที่" in question or "เนื้อที่" in question or ai.get("metric") == "area":
         metric = "เนื้อที่เก็บเกี่ยว (ไร่)"
     elif "ต่อไร่" in question or ai.get("metric") == "yield":
@@ -136,8 +162,8 @@ def answer(question, district_df, province_df):
         result = result.head(max(1, min(top, 50)))
     else:
         result = result.sort_values([c for c in ["จังหวัด", "อำเภอ", "พืช", "ปี"] if c in result])
-    years = sorted(int(v) for v in valid["ปี"].dropna().unique())
-    header = f"พบ **{len(valid):,} รายการ** ระดับ**{level}** | ปีข้อมูล: {', '.join(map(str,years))}"
+    years = sorted(str(v) for v in valid["ปี"].dropna().unique())
+    header = f"พบ **{len(valid):,} รายการ** ระดับ**{level}** | ปีข้อมูล: {', '.join(years)}"
     if shown:
         header += "\n\nเงื่อนไข: " + " · ".join(shown)
     header += "\n\nแสดงค่าจากรายการข้อมูลต้นฉบับ **ไม่รวมยอดข้ามปี/ข้ามพืช และไม่ใช้ยอดจังหวัดแทนข้อมูลอำเภอ**"
@@ -177,7 +203,7 @@ with st.sidebar:
         else:
             st.metric(f"รายการระดับ{name}", f"{len(df):,}")
             st.caption(f"{df['จังหวัด'].nunique()} จังหวัด · พืช {df['พืช'].nunique()} ชนิด")
-    st.caption("อ่านข้อมูลจาก CSV ใน GitHub เท่านั้น · ไม่อ่านไฟล์ XLSX หรือ Google Sheets")
+    st.caption("อ่านข้อมูลจาก CSV ใน GitHub เท่านั้น · รองรับปีเพาะปลูกแบบ 2565/2566 · ไม่อ่านไฟล์ XLSX หรือ Google Sheets")
     if st.button("🔄 โหลดข้อมูลใหม่"):
         load_csv.clear()
         st.rerun()
