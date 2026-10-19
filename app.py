@@ -1,1059 +1,292 @@
-"""AgriData AI V3.3: district missing kg/rai filled from published OAE provincial figures, with explicit provenance.
-Upload app.py + requirements.txt + data.csv + province_data.csv to GitHub root.
+"""AgriData AI – clean rebuild from eight supplied original provincial workbooks.
+Numerical answers are deterministic CSV lookups; province-reference quantities never
+become district results. Optional Gemini key is not required for data searching.
 """
-import hmac
-import html
 import io
-import json
+import hmac
 import re
 from pathlib import Path
 
 import pandas as pd
-import altair as alt
 import streamlit as st
 
-st.set_page_config(page_title="AgriData AI | ถามข้อมูลการเกษตร", page_icon="🌾", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="AgriData AI · ฐานข้อมูล 8 จังหวัด", page_icon="🌾", layout="wide", initial_sidebar_state="collapsed")
 BASE = Path(__file__).resolve().parent
-FILES = {"อำเภอ": "data.csv", "จังหวัด": "province_data.csv"}
-NUMBERS = {"ผลผลิต (ตัน)": "ผลผลิต (ตัน)", "เนื้อที่เก็บเกี่ยว (ไร่)": "เนื้อที่เก็บเกี่ยว (ไร่)", "ผลผลิตต่อไร่ (กก./ไร่)": "ผลผลิตต่อไร่ (กก./ไร่)"}
-
-def secret(key):
-    try:
-        return str(st.secrets.get(key, ""))
-    except (FileNotFoundError, KeyError):
-        return ""
-
-@st.cache_data(show_spinner=False)
-def load_csv(file_name, size, modified):
-    # size & modified invalidate the Streamlit data cache when a file changes.
-    df = pd.read_csv(BASE / file_name, encoding="utf-8-sig", dtype={"จังหวัด": str, "อำเภอ": str, "พืช": str}, low_memory=False)
-    for field in ["จังหวัด", "อำเภอ", "พืช"]:
-        if field in df:
-            df[field] = df[field].fillna("").astype(str).str.strip()
-    if "ปี" in df:
-        df["ปี"] = df["ปี"].fillna("").astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
-        df["ปีเรียงลำดับ"] = pd.to_numeric(df["ปี"].str.extract(r"(25\d{2}|20\d{2})")[0], errors="coerce")
-    for field in NUMBERS:
-        if field in df:
-            df[field] = pd.to_numeric(df[field].astype(str).str.replace(",", "", regex=False), errors="coerce")
-    # IMPORTANT: do not synthesize missing district yields from production/area.
-    # data.csv carries either the original district-data value or the *published*
-    # OAE provincial average, distinguished per row by ประเภทผลผลิตต่อไร่.
-    # An OAE province average is NOT an observed district yield.
-    return df
-
-def data_for(level):
-    filename = FILES[level]
-    path = BASE / filename
-    if not path.exists():
-        return None
-    return load_csv(filename, path.stat().st_size, path.stat().st_mtime_ns)
-
-def norm(s):
-    return re.sub(r"\s+", "", str(s)).replace("จังหวัด", "").replace("อำเภอ", "")
-
-def extract_filter(question, values):
-    candidates = sorted((v for v in values if str(v).strip()), key=lambda x: len(str(x)), reverse=True)
-    normalized_question = norm(question)
-    return next((item for item in candidates if norm(item) in normalized_question), None)
-
-# Support common, unambiguous short province names without silently broadening a query.
-# Avoid the alias "หนอง": it could mean หนองคาย or หนองบัวลำภู.
-PROVINCE_ALIASES = {
-    "อุดรธานี": ("อุดรธานี", "อุดร"),
-    "หนองบัวลำภู": ("หนองบัวลำภู", "หนองบัว"),
-    "หนองคาย": ("หนองคาย",),
-    "ขอนแก่น": ("ขอนแก่น",),
-    "กาฬสินธุ์": ("กาฬสินธุ์", "กาฬ"),
-    "บึงกาฬ": ("บึงกาฬ",),
-    "สกลนคร": ("สกลนคร", "สกล"),
-    "มหาสารคาม": ("มหาสารคาม", "มหาสาร"),
-}
-
-def provinces_in_question(question, options):
-    q = norm(question)
-    valid = set(map(str, options))
-    # Check longest aliases first so "บึงกาฬ" is not mistaken for "กาฬสินธุ์".
-    hits = []
-    taken = []
-    pairs = sorted(
-        ((norm(alias), full) for full, aliases in PROVINCE_ALIASES.items() for alias in aliases if full in valid),
-        key=lambda pair: len(pair[0]), reverse=True,
-    )
-    for alias, full in pairs:
-        start = q.find(alias)
-        if start < 0:
-            continue
-        end = start + len(alias)
-        if any(not (end <= lo or start >= hi) for lo, hi in taken):
-            continue
-        taken.append((start, end))
-        if full not in hits:
-            hits.append(full)
-    # Include any province not listed above by its exact name.
-    for name in valid - set(PROVINCE_ALIASES):
-        if norm(name) in q and name not in hits:
-            hits.append(name)
-    return hits
-
-def resolve_province(question, options):
-    hits = provinces_in_question(question, options)
-    return hits[0] if len(hits) == 1 else None
-
-def is_coverage_question(question, prior_coverage=False):
-    q = re.sub(r"\s+", "", str(question))
-    if prior_coverage and q.endswith("ด้วย") and "ผลผลิต" not in q and "พื้นที่" not in q:
-        return True
-    return (("มีข้อมูล" in q or "มีฐานข้อมูล" in q or "ข้อมูลของ" in q or "ข้อมูลจังหวัดไหน" in q)
-            and any(k in q for k in ("ไหม", "มั้ย", "หรือเปล่า", "บ้าง", "หรือไม่", "มีอยู่")))
-
-def coverage_answer(question, district_df, province_df):
-    """Answer existence questions without displaying a 40-row provincial table."""
-    choices = sorted(set(district_df["จังหวัด"].dropna().tolist()) | set(province_df["จังหวัด"].dropna().tolist()))
-    matches = provinces_in_question(question, choices)
-    crops = sorted(set(district_df["พืช"].dropna().tolist()) | set(province_df["พืช"].dropna().tolist()))
-    crop, explicit_crop = resolve_crop(question, crops)
-    # User asks what provinces are in the database, not their complete records.
-    if not matches:
-        if any(k in question for k in ("จังหวัดไหน", "จังหวัดอะไร", "จังหวัดใด", "จังหวัดบ้าง", "จังหวัดทั้งหมด", "ทุกจังหวัด")):
-            return f"✅ มีข้อมูล **{len(choices)} จังหวัด** ได้แก่ " + ", ".join(choices) + " ครับ"
-        return "ไม่พบชื่อจังหวัดที่ระบุครับ ลองพิมพ์ชื่อเต็ม เช่น **อุดรธานี** หรือ **หนองบัวลำภู**"
-    result = []
-    for province_name in matches:
-        prov_rows = province_df[province_df["จังหวัด"] == province_name]
-        dist_rows = district_df[district_df["จังหวัด"] == province_name]
-        if explicit_crop:
-            if crop is None:
-                result.append(f"ไม่พบชนิดพืชที่ระบุสำหรับ **{province_name}** ครับ")
-                continue
-            prov_rows = prov_rows[prov_rows["พืช"] == crop]
-            dist_rows = dist_rows[dist_rows["พืช"] == crop]
-            if prov_rows.empty and dist_rows.empty:
-                result.append(f"ยังไม่พบข้อมูล **{crop}** ของจังหวัด**{province_name}** ครับ")
-                continue
-        if prov_rows.empty and dist_rows.empty:
-            result.append(f"ยังไม่พบข้อมูลจังหวัด**{province_name}** ครับ")
-            continue
-        cstr = f" (พืช: **{crop}**)" if crop else ""
-        result.append(f"✅ มีข้อมูลจังหวัด**{province_name}**{cstr}ครับ — ระดับจังหวัด **{len(prov_rows):,} รายการ** · ระดับอำเภอ **{len(dist_rows):,} รายการ**")
-    return "\n\n".join(result) + "\n\n_จำนวนรายการเป็นจำนวนระเบียนที่มีในไฟล์ ไม่ได้หมายถึงข้อมูลผลผลิตครบทุกพืชหรือทุกปี_"
-
-# Normalize common Thai crop names before using optional AI filters.
-# An explicitly named crop always takes priority; never show all crops if a requested crop is absent.
-CROP_ALIASES = {
-    "อ้อย": ["อ้อยโรงงาน", "อ้อย"],
-    "อ้อยโรงงาน": ["อ้อยโรงงาน", "อ้อย"],
-    "มัน": ["มันสำปะหลังโรงงาน", "มันสำปะหลัง"],
-    "มันสำปะหลัง": ["มันสำปะหลังโรงงาน", "มันสำปะหลัง"],
-    "มันสำปะหลังโรงงาน": ["มันสำปะหลังโรงงาน", "มันสำปะหลัง"],
-    "ยาง": ["ยางพารา"],
-    "ยางพารา": ["ยางพารา"],
-    "ข้าวนาปี": ["ข้าวนาปี"],
-    "นาปี": ["ข้าวนาปี"],
-    "ข้าวนาปรัง": ["ข้าวนาปรัง"],
-    "นาปรัง": ["ข้าวนาปรัง"],
-}
-
-def resolve_crop(question, options):
-    """Return (chosen crop, explicitly_requested). No silent fallback to unrelated crops."""
-    q = re.sub(r"\s+", "", str(question))
-    options_by_norm = {re.sub(r"\s+", "", str(o)): o for o in options}
-    # Longer names first, so 'อ้อยโรงงาน' wins over 'อ้อย' and 'ข้าวนาปรัง' over 'นาปรัง'.
-    for alias in sorted(CROP_ALIASES, key=len, reverse=True):
-        if alias not in q:
-            continue
-        for target in CROP_ALIASES[alias]:
-            key = re.sub(r"\s+", "", target)
-            if key in options_by_norm:
-                return options_by_norm[key], True
-        return None, True
-    if "ข้าว" in q and "นาปี" not in q and "นาปรัง" not in q:
-        return None, True  # rice type is ambiguous, require clarification
-    # Other exact crop names in this particular data set.
-    direct = extract_filter(question, options)
-    if direct:
-        return direct, True
-    return None, False
-
-def available_year(question, df):
-    # Return requested B.E./C.E. year as a text token; source years may be crop seasons such as 2565/2566.
-    m = re.search(r"(?<!\d)(25\d{2}|20\d{2})(?!\d)", question)
-    if not m:
-        return None
-    y = int(m.group(1))
-    if y < 2200 and (df["ปีเรียงลำดับ"].dropna() >= 2400).any():
-        y += 543
-    return str(y)
-
-def period_matches(period, year):
-    # A season labelled 2565/2566 should match either 2565 or 2566, but not 2567.
-    text = str(period).strip()
-    if text == year:
-        return True
-    parts = re.split(r"[/-]", text)
-    if len(parts) < 2:
-        return False
-    try:
-        first = int(parts[0]); second = int(parts[1])
-        if second < 100:
-            second = (first // 100) * 100 + second
-        return int(year) in (first, second)
-    except ValueError:
-        return False
-
-def no_results(raw, level, question):
-    crops = ', '.join(sorted(raw['พืช'].dropna().astype(str).unique()))
-    years = ', '.join(sorted(raw['ปี'].dropna().astype(str).unique()))
-    return (f"ไม่พบข้อมูลระดับ{level} ที่ตรงครบทุกเงื่อนไข\n\n"
-            f"**ปีที่มีในฐานข้อมูลระดับนี้:** {years}\n\n"
-            f"**พืชที่มี:** {crops}\n\n"
-            "หมายเหตุ: ปีเพาะปลูกอาจเขียนเป็น 2565/2566 หรือ 2560/61 "
-            "ซึ่งไม่ใช่ปีข้อมูล 2567; ลองถามโดยไม่ระบุปี หรือใช้ตัวกรองด้านซ้าย")
-
-def try_ai(question, df, level):
-    """AI is optional; it only chooses filters, never produces statistics."""
-    key = secret("GEMINI_API_KEY")
-    if not key.strip():
-        return {}
-    try:
-        from google import genai
-        from google.genai import types
-        import json
-        values = {c: sorted(df[c].dropna().astype(str).unique().tolist()) for c in ("จังหวัด", "พืช") if c in df}
-        if level == "อำเภอ":
-            values["อำเภอ"] = sorted(df["อำเภอ"].dropna().astype(str).unique().tolist())
-        prompt = f'''Extract structured filters for a Thai agricultural database. Output JSON only with optional keys province, district, crop, year, metric, group, top_n. Exact strings MUST be from options. If unclear use null, not guesses. crop 'ข้าวนาปี' is distinct from 'ข้าวนาปรัง'. metric one of production, area, yield. group one of district, province, crop, year, none. Do not invent statistics. Options: {json.dumps(values,ensure_ascii=False)}. Question: {question}'''
-        answer = genai.Client(api_key=key).models.generate_content(model="gemini-2.5-flash-lite", contents=prompt, config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0))
-        parsed = json.loads(answer.text)
-        return parsed if isinstance(parsed, dict) else {}
-    except Exception:
-        return {}
-
-def evidence_note(rows, level):
-    """Explain observed district figures vs estimates using province-wide mean yield."""
-    if level != "อำเภอ" or rows is None or rows.empty:
-        return ""
-    status = rows["สถานะข้อมูล"].fillna("").astype(str) if "สถานะข้อมูล" in rows else pd.Series([], dtype=str)
-    method = rows["วิธีได้มา"].fillna("").astype(str) if "วิธีได้มา" in rows else pd.Series([], dtype=str)
-    estimated = status.str.contains("พื้นที่เก็บเกี่ยวอำเภอ × ผลผลิตเฉลี่ยจังหวัด", regex=False) | method.str.contains("ผลผลิตเฉลี่ยจังหวัด สศก.", regex=False)
-    derived = status.str.contains("คำนวณรวมจากข้อมูลจริงรายอำเภอ", regex=False)
-    fixed = status.str.contains("อัตราผลผลิตคงที่", regex=False)
-    direct = ~(estimated | derived | fixed)
-    notes = ["**คำอธิบายที่มาของตัวเลขรายอำเภอ** (ดูคอลัมน์ ‘คำอธิบายข้อมูล’ ประกอบ)"]
-    if direct.any(): notes.append(f"• ข้อมูลรายอำเภอจากเอกสาร: {int(direct.sum())} รายการ — เป็นค่าที่ระบุในเอกสารระดับอำเภอหรือหน่วยงานที่เกี่ยวข้อง ไม่ได้หมายความว่า สศก. รับรองค่ารายอำเภอทุกค่า")
-    if derived.any(): notes.append(f"• ผลรวมจากรายการรายอำเภอ: {int(derived.sum())} รายการ — คำนวณรวมรายการย่อยที่มีข้อมูลระดับอำเภอ")
-    if estimated.any(): notes.append(f"• **ผลผลิตรายอำเภอประมาณการโดยใช้อัตราผลผลิตเฉลี่ยระดับจังหวัดของ สศก.: {int(estimated.sum())} รายการ** — นำพื้นที่เก็บเกี่ยวรายอำเภอ × ผลผลิตเฉลี่ยจังหวัด ÷ 1,000 **ไม่ใช่ผลผลิตรายอำเภอที่ สศก. รายงานโดยตรง และไม่ใช่การนำยอดรวมจังหวัดมาใส่แทนรายอำเภอ**")
-    if fixed.any(): notes.append(f"• ผลผลิตคำนวณตามอัตราคงที่ของรายงานท้องถิ่น: {int(fixed.sum())} รายการ — เป็นค่าคำนวณ ไม่ใช่ผลสำรวจผลผลิตจริง")
-    notes.append("⚠️ รายการประมาณการไม่ควรใช้จัดอันดับ/อ้างว่าเป็นผลผลิตจริงรายอำเภอโดยไม่ระบุวิธีประมาณ; โปรดตรวจปีข้อมูลและหลักฐานก่อนใช้ในรายงานราชการ")
-    return "\n\n" + "\n\n".join(notes)
-
-def add_explanation(df, level):
-    df = df.copy()
-    if level == "จังหวัด":
-        df["คำอธิบายข้อมูล"] = "ข้อมูลสรุประดับจังหวัดจากเอกสารอ้างอิง สศก."
-        return df
-    if "สถานะข้อมูล" not in df: return df
-    status = df["สถานะข้อมูล"].fillna("").astype(str)
-    descriptions = []
-    for val in status:
-        if "พื้นที่เก็บเกี่ยวอำเภอ × ผลผลิตเฉลี่ยจังหวัด" in val:
-            descriptions.append("ประมาณการระดับอำเภอจากพื้นที่เก็บเกี่ยวอำเภอ × ผลผลิตเฉลี่ยระดับจังหวัด สศก. ÷ 1,000; ไม่ใช่ตัวเลขผลผลิตรายอำเภอที่ สศก. รายงานโดยตรง")
-        elif "คำนวณรวมจากข้อมูลจริงรายอำเภอ" in val:
-            descriptions.append("คำนวณรวมจากรายการข้อมูลจริงในระดับอำเภอ (โปรดดูวิธีได้มา)")
-        elif "อัตราผลผลิตคงที่" in val:
-            descriptions.append("ค่าคำนวณตามอัตราผลผลิตคงที่จากรายงานท้องถิ่น ไม่ใช่ผลผลิตที่สำรวจโดยตรง")
-        else:
-            descriptions.append("ผลผลิตระดับอำเภอตามเอกสารอ้างอิง โปรดตรวจปีและประเภทหลักฐาน")
-    df["คำอธิบายข้อมูล"] = descriptions
-    if "ประเภทผลผลิตต่อไร่" in df.columns:
-        proxy = df["ประเภทผลผลิตต่อไร่"].fillna("").str.contains("ค่าเฉลี่ยระดับจังหวัด สศก.", regex=False)
-        df.loc[proxy, "คำอธิบายข้อมูล"] += (" · ผลผลิตต่อไร่ที่แสดงใช้ค่าเฉลี่ยจังหวัด สศก. "
-                                                 "ไม่ใช่ค่าเฉลี่ยที่สำรวจจริงระดับอำเภอ")
-    return df
-
-YIELD_EXPLANATION = ("📏 **ผลผลิตต่อไร่ (กก./ไร่):** บางแถวใช้ค่าเฉลี่ยระดับจังหวัดของ สศก. "
-                     "โปรดดูปีอ้างอิงและที่มาของค่าผลผลิตต่อไร่ในตาราง")
-
-def with_yield_note(message, table=None):
-    """A one-line note for successful data answers; never repeat long text on errors."""
-    message = str(message).strip()
-    if table is None or getattr(table, "empty", True):
-        return message
-    if "ประเภทผลผลิตต่อไร่" in table.columns and table["ประเภทผลผลิตต่อไร่"].fillna("").str.contains("ค่าเฉลี่ยระดับจังหวัด สศก.",regex=False).any():
-        return message + "\n\n" + YIELD_EXPLANATION
-    return message
-
-# --- Conversational search: deterministic context resolution, no invented statistics ---
-RICE_TYPES = ("ข้าวนาปี", "ข้าวนาปรัง")
-
-
-def rice_is_generic(question):
-    q = str(question).replace(" ", "")
-    return "ข้าว" in q and not any(x in q for x in ("ข้าวนาปี", "ข้าวนาปรัง", "นาปี", "นาปรัง"))
-
-
-def mentioned_crop(question, choices):
-    value, explicit = resolve_crop(question, choices)
-    return value if explicit else None
-
-
-def build_conversational_query(question, context, district_df, province_df):
-    """Fill missing dimensions from chat state; return (query, pending_reply, new_context).
-    The original user's wording is preserved, while inherited dimensions are appended.
-    """
-    user_q = str(question).strip()
-    ctx = dict(context or {})
-    crops = sorted(set(district_df["พืช"].dropna().tolist()) | set(province_df["พืช"].dropna().tolist()))
-    provinces = sorted(set(district_df["จังหวัด"].dropna().tolist()) | set(province_df["จังหวัด"].dropna().tolist()))
-    districts = sorted(set(district_df["อำเภอ"].dropna().tolist()))
-    crop, _ = resolve_crop(user_q, crops)
-    prov = resolve_province(user_q, provinces)
-    dist = extract_filter(user_q, districts)
-    clear_context = any(w in user_q for w in ("เริ่มใหม่", "ล้างบริบท", "เปลี่ยนเรื่อง"))
-    if clear_context:
-        ctx = {}
-    asked_rice = rice_is_generic(user_q)
-    # 'ข้าว' without any location is a genuine choice; keep short.
-    if asked_rice and not prov and not dist and not ctx.get("province"):
-        return user_q, "🌾 ต้องการ **ข้าวนาปี** หรือ **ข้าวนาปรัง** ครับ?", {"pending_rice": True}
-    # A province-specific generic rice query means two separate crop rows, not adding them.
-    if asked_rice:
-        ctx.pop("crop", None)
-        ctx["rice_both"] = True
-        ctx.pop("pending_rice", None)
-    if crop:
-        ctx["crop"] = crop
-        ctx.pop("rice_both", None)
-        ctx.pop("pending_rice", None)
-    if prov:
-        if prov != ctx.get("province"):
-            ctx.pop("district", None)
-        ctx["province"] = prov
-    if dist:
-        ctx["district"] = dist
-        # If the district's province is unique, resolve it from the data.
-        matched = district_df.loc[district_df["อำเภอ"] == dist, "จังหวัด"].dropna().unique()
-        if len(matched) == 1:
-            ctx["province"] = matched[0]
-    if "รายอำเภอ" in user_q or "แต่ละอำเภอ" in user_q or "ขอรายอำเภอ" in user_q or dist:
-        ctx["level"] = "อำเภอ"
-    elif "ระดับจังหวัด" in user_q or "รวมจังหวัด" in user_q or "ทั้งจังหวัด" in user_q:
-        ctx["level"] = "จังหวัด"
-        ctx.pop("district", None)
-    elif "จังหวัด" in user_q and "อำเภอ" not in user_q:
-        ctx["level"] = "จังหวัด"
-        ctx.pop("district", None)
-    ctx.setdefault("level", "จังหวัด")
-    year_match = re.search(r"(?<!\d)(25\d{2}|20\d{2})(?!\d)", user_q)
-    if year_match:
-        ctx["year"] = year_match.group(1)
-    elif "ปีล่าสุด" in user_q or "ล่าสุด" in user_q or "ไม่ระบุปี" in user_q:
-        ctx.pop("year", None)
-    if ctx.get("pending_rice") and not crop:
-        return user_q, "🌾 ต้องการ **ข้าวนาปี** หรือ **ข้าวนาปรัง** ครับ?", ctx
-    # Query synthesis: never pass stale crop from prior question if a new crop named.
-    suffix = []
-    if ctx.get("province") and not prov:
-        suffix.append("จังหวัด" + ctx["province"])
-    if ctx.get("district") and not dist and ctx.get("level") == "อำเภอ":
-        suffix.append("อำเภอ" + ctx["district"])
-    if ctx.get("crop") and not crop and not asked_rice:
-        suffix.append(ctx["crop"])
-    if ctx.get("level") == "อำเภอ" and "อำเภอ" not in user_q:
-        suffix.append("รายอำเภอ")
-    if ctx.get("level") == "จังหวัด" and "อำเภอ" not in user_q and "จังหวัด" not in user_q:
-        suffix.append("ระดับจังหวัด")
-    if ctx.get("year") and not year_match and "ล่าสุด" not in user_q:
-        suffix.append("ปี " + ctx["year"])
-    query = user_q + " " + " ".join(suffix)
-    return query, None, ctx
-
-
-def answer_both_rice(question, district_df, province_df):
-    """Display napee/naprang independently at province scope, with no addition."""
-    level = "อำเภอ" if "รายอำเภอ" in question or "แต่ละอำเภอ" in question else "จังหวัด"
-    raw = district_df if level == "อำเภอ" else province_df
-    prov = resolve_province(question, raw["จังหวัด"].dropna().unique())
-    if not prov:
-        return "ต้องการข้อมูลข้าวของ **จังหวัดไหน** ครับ?", None, None
-    subset = raw[(raw["จังหวัด"] == prov) & (raw["พืช"].isin(RICE_TYPES))].copy()
-    if subset.empty:
-        return f"ไม่พบข้อมูลข้าวนาปีหรือข้าวนาปรังระดับ{level}ของ{prov}", None, None
-    year = available_year(question, raw)
-    if year:
-        subset = subset[subset["ปี"].apply(lambda x: period_matches(x,year))]
-    elif "ย้อนหลัง" not in question and "ทุกปี" not in question:
-        keys=["จังหวัด","พืช"]+(["อำเภอ"] if level=="อำเภอ" else [])
-        subset=subset[subset["ปีเรียงลำดับ"]==subset.groupby(keys,dropna=False)["ปีเรียงลำดับ"].transform("max")]
-    if subset.empty:
-        return f"ไม่พบข้อมูลข้าวนาปีหรือข้าวนาปรังของ{prov} ในปีที่ระบุ",None,None
-    subset=add_explanation(subset,level)
-    cols=[c for c in ["จังหวัด","อำเภอ","พืช","ปี","เนื้อที่เก็บเกี่ยว (ไร่)","ผลผลิต (ตัน)","ผลผลิตต่อไร่ (กก./ไร่)","ประเภทผลผลิตต่อไร่","ปีอ้างอิงผลผลิตต่อไร่","อ้างอิงผลผลิตต่อไร่ สศก.","คำอธิบายข้อมูล","สถานะข้อมูล","แหล่งข้อมูล","อ้างอิง สศก.","ลิงก์อ้างอิง","URL สศก."] if c in subset]
-    table=subset[cols].sort_values([c for c in ["พืช","อำเภอ","ปี"] if c in cols])
-    years=sorted(subset["ปี"].astype(str).unique())
-    warning=" · ⚠️ ข้อมูลอาจคนละปี" if len(years)>1 else ""
-    return (f"🌾 **ข้าวนาปีและข้าวนาปรัง จังหวัด{prov}** — แสดงแยกประเภท ไม่รวมยอด{warning}\n\n"
-            + f"ปีข้อมูล: {', '.join(years)}"), table, "ผลผลิต (ตัน)"
-
-
-def answer(question, district_df, province_df):
-    level = "อำเภอ" if "อำเภอ" in question or "รายอำเภอ" in question else "จังหวัด"
-    if "จังหวัด" in question and "อำเภอ" in question:
-        level = "อำเภอ"
-    raw = district_df if level == "อำเภอ" else province_df
-    if raw is None or raw.empty:
-        return f"ไม่มีไฟล์ข้อมูลระดับ{level} กรุณาอัปโหลด {FILES[level]}", None, None
-    df = raw.copy()
-    if "จังหวัด" in question and not resolve_province(question, df["จังหวัด"].dropna().unique()):
-        if not any(term in question for term in ("จังหวัดไหน", "จังหวัดใด", "จังหวัดอะไร", "จังหวัดทั้งหมด", "ทุกจังหวัด")):
-            return "ไม่พบชื่อจังหวัดที่ระบุครับ กรุณาพิมพ์ชื่อจังหวัดให้ชัดเจน", None, None
-    ai = try_ai(question, df, level)
-    shown = []
-    for field, ai_field in [("จังหวัด", "province"), ("อำเภอ", "district"), ("พืช", "crop")]:
-        if field not in df:
-            continue
-        choices = df[field].dropna().astype(str).unique().tolist()
-        if field == "พืช":
-            chosen, explicitly_requested = resolve_crop(question, choices)
-            # If a recognized crop has no corresponding database entry, return an empty result;
-            # never ignore the user's crop filter and display other crops instead.
-            if explicitly_requested and chosen is None:
-                if "ข้าว" in question and "นาปี" not in question and "นาปรัง" not in question:
-                    return "กรุณาระบุ **ข้าวนาปี** หรือ **ข้าวนาปรัง** เพื่อป้องกันการรวมข้อมูลคนละประเภท", None, None
-                return (f"ไม่พบพืชที่ระบุในฐานข้อมูลระดับ{level}\n\n"
-                        f"พืชที่มี: {', '.join(sorted(choices))}"), None, None
-        elif field == "จังหวัด":
-            chosen = resolve_province(question, choices)
-        else:
-            chosen = extract_filter(question, choices)
-        ai_candidate = ai.get(ai_field)
-        if not chosen and field == "พืช" and not explicitly_requested:
-            # AI can assist for unrecognized crop words, but cannot override explicit filters.
-            if ai_candidate in choices:
-                chosen = ai_candidate
-        elif not chosen and field != "พืช" and ai_candidate in choices:
-            chosen = ai_candidate
-        if chosen:
-            df = df[df[field] == chosen]
-            shown.append(f"{field}: {chosen}")
-    year = available_year(question, raw)
-    if year is None and ai.get("year") is not None:
-        try:
-            year = str(int(ai["year"]))
-        except (TypeError, ValueError):
-            pass
-    if year is not None:
-        df = df[df["ปี"].apply(lambda x: period_matches(x, year))]
-        shown.append(f"ปี: {year}")
-    else:
-        # Avoid merging unlike year periods; per province/crop choose latest available year.
-        keys = ["จังหวัด", "พืช"] + (["อำเภอ"] if level == "อำเภอ" else [])
-        if "ย้อนหลัง" not in question and "ทุกปี" not in question and "แนวโน้ม" not in question:
-            df = df[df["ปีเรียงลำดับ"] == df.groupby(keys, dropna=False)["ปีเรียงลำดับ"].transform("max")]
-            shown.append("ปีล่าสุดแยกตามรายการ (อาจต่างปีกัน)")
-    if df.empty:
-        return no_results(raw, level, question), None, None
-    if "ต่อไร่" in question or "กก./ไร่" in question:
-        metric = "ผลผลิตต่อไร่ (กก./ไร่)"
-    elif "พื้นที่" in question or "เนื้อที่" in question or ai.get("metric") == "area":
-        metric = "เนื้อที่เก็บเกี่ยว (ไร่)"
-    elif ai.get("metric") == "yield":
-        metric = "ผลผลิตต่อไร่ (กก./ไร่)"
-    else:
-        metric = "ผลผลิต (ตัน)"
-    if metric not in df.columns:
-        return f"ไฟล์ระดับ{level} ไม่มีคอลัมน์ {metric}", None, None
-    valid = df[df[metric].notna()].copy()
-    if valid.empty:
-        return f"มีรายการที่ตรงกับคำถาม แต่ไม่มีตัวเลข {metric} ในไฟล์ต้นทาง", None, None
-    # Never add separate years or crops by default. Preserve individual records.
-    valid = add_explanation(valid, level)
-    cols = [c for c in ["คำอธิบายข้อมูล", "จังหวัด", "อำเภอ", "พืช", "ปี", "เนื้อที่เก็บเกี่ยว (ไร่)", "ผลผลิต (ตัน)", "ผลผลิตต่อไร่ (กก./ไร่)", "ประเภทผลผลิตต่อไร่", "ปีอ้างอิงผลผลิตต่อไร่", "อ้างอิงผลผลิตต่อไร่ สศก.", "ลิงก์อ้างอิงผลผลิตต่อไร่ สศก.", "หมายเหตุผลผลิตต่อไร่", "สถานะข้อมูล", "วิธีได้มา", "ประเภทหลักฐาน", "แหล่งข้อมูล", "อ้างอิง สศก.", "ลิงก์อ้างอิง", "URL สศก.", "ข้อจำกัด", "ไฟล์ต้นฉบับ"] if c in valid]
-    result = valid[cols].copy()
-    wants_ranking = any(term in question for term in ("อันดับ", "มากที่สุด", "สูงสุด", "น้อยที่สุด", "ต่ำสุด", "เปรียบเทียบ", "เทียบ", "จังหวัดไหน", "อำเภอไหน"))
-    years_compared = sorted(str(v) for v in valid["ปี"].dropna().unique())
-    if wants_ranking and len(years_compared)>1:
-        comparison_warning = "⛔ **ยังไม่จัดอันดับหรือสรุปผู้ชนะ** เพราะรายการที่ค้นพบมีข้อมูลต่างปี/ฤดูเพาะปลูก กรุณาระบุปีเดียวกัน หรือดูข้อมูลแยกปีในตาราง"
-    else:
-        comparison_warning = ""
-    if wants_ranking and not comparison_warning:
-        result = result.sort_values(metric, ascending=True if "น้อยที่สุด" in question else False)
-        match = re.search(r"(?:อันดับ|สูงสุด|มากที่สุด)\s*(\d{1,2})", question)
-        top = int(match.group(1)) if match else 10
-        result = result.head(max(1, min(top, 50)))
-    else:
-        result = result.sort_values([c for c in ["จังหวัด", "อำเภอ", "พืช", "ปี"] if c in result])
-    years = sorted(str(v) for v in valid["ปี"].dropna().unique())
-    header = f"พบ **{len(valid):,} รายการ** ระดับ**{level}** | ปีข้อมูล: {', '.join(years)}"
-    if shown:
-        header += "\n\nเงื่อนไข: " + " · ".join(shown)
-    header += "\n\nแสดงค่าตามรายการในฐานข้อมูล ไม่รวมยอดข้ามปี/ข้ามพืช และไม่ใช้ยอดรวมจังหวัดแทนยอดอำเภอ"
-    if comparison_warning:
-        header += "\n\n" + comparison_warning
-    if level == "อำเภอ":
-        if "ประเภทผลผลิตต่อไร่" in valid.columns:
-            proxy = valid["ประเภทผลผลิตต่อไร่"].fillna("").str.contains("ค่าเฉลี่ยระดับจังหวัด สศก.", regex=False)
-            if proxy.any():
-                header += f"\n\n📏 **ผลผลิตต่อไร่ {int(proxy.sum())} รายการ** ใช้ค่าเฉลี่ยระดับจังหวัด สศก. (ดูปีและตารางอ้างอิงในผลลัพธ์) ไม่ใช่ค่าที่สำรวจรายอำเภอ"
-        short_sources = valid.apply(lambda row: source_short(row, level), axis=1).dropna().unique().tolist()
-        if short_sources:
-            header += "\n\n📚 **ที่มา:** " + " · ".join(str(x) for x in short_sources[:2])
-            if len(short_sources) > 2:
-                header += " (ดูที่มาเพิ่มเติมในตาราง)"
-    if len(years) > 1:
-        header += "\n\n⚠️ รายการอาจมีปีข้อมูลต่างกัน ไม่ควรใช้จัดอันดับเปรียบเทียบโดยตรงจนกว่าจะเลือกปีเดียวกัน"
-    return header, result, metric
-
-
-# --- V2: evidence QA, export, dashboard, and human-readable comparisons ---
-def audit(df, level):
-    if df is None or df.empty:
-        return pd.DataFrame(columns=["ระดับ", "แถว", "ประเด็น", "รายละเอียด"])
-    problems=[]
-    for i, row in df.iterrows():
-        keys=[str(row.get(c, "")).strip() for c in ("จังหวัด", "พืช", "ปี")]
-        if any(not x or x=="nan" for x in keys):
-            problems.append([level, i+2, "ข้อมูลระบุตัวตนไม่ครบ", "จังหวัด/พืช/ปีต้องไม่ว่าง"])
-        area=pd.to_numeric(row.get("เนื้อที่เก็บเกี่ยว (ไร่)"),errors="coerce")
-        prod=pd.to_numeric(row.get("ผลผลิต (ตัน)"),errors="coerce")
-        yieldval=pd.to_numeric(row.get("ผลผลิตต่อไร่ (กก./ไร่)"),errors="coerce")
-        if (pd.notna(area) and area<0) or (pd.notna(prod) and prod<0) or (pd.notna(yieldval) and yieldval<0):
-            problems.append([level,i+2,"ค่าติดลบ","พบค่าตัวเลขติดลบ"])
-        # A published *provincial average* is not expected to equal a district's
-        # observed production / area. Never flag that difference as bad data.
-        is_prov_proxy = (level == "อำเภอ" and "ค่าเฉลี่ยระดับจังหวัด สศก." in str(row.get("ประเภทผลผลิตต่อไร่", "")))
-        if not is_prov_proxy and pd.notna(area) and pd.notna(prod) and pd.notna(yieldval) and area>0:
-            computed=prod*1000/area
-            if abs(computed-yieldval)>max(5, 0.02*abs(computed)):
-                problems.append([level,i+2,"ผลผลิตต่อไร่ไม่สอดคล้อง",f"คำนวณได้ {computed:,.2f} กก./ไร่ แต่ข้อมูลระบุ {yieldval:,.2f}"])
-        if pd.notna(prod) and (pd.isna(area) or area==0):
-            # missing area is common and NOT automatically a data error; no warning
-            pass
-    cols=["จังหวัด", "พืช", "ปี"] + (["อำเภอ"] if level=="อำเภอ" else [])
-    if set(cols).issubset(df.columns):
-        for idx in df.index[df.duplicated(cols,keep=False)]:
-            problems.append([level,int(idx)+2,"ระเบียนซ้ำ"," / ".join(str(df.loc[idx,c]) for c in cols)])
-    return pd.DataFrame(problems,columns=["ระดับ", "แถว", "ประเด็น", "รายละเอียด"])
-
-def to_excel_bytes(df):
-    output=io.BytesIO()
-    with pd.ExcelWriter(output,engine="xlsxwriter") as writer:
-        df.to_excel(writer,index=False,sheet_name="ข้อมูล")
-        ws=writer.sheets["ข้อมูล"]
-        ws.freeze_panes(1,0)
-        ws.autofilter(0,0,max(len(df),1),max(len(df.columns)-1,0))
-        for ix,col in enumerate(df.columns):
-            ws.set_column(ix,ix,min(max(len(str(col))+3,16),45))
-        numeric_format=writer.book.add_format({"num_format":"#,##0.00"})
-        for ix,col in enumerate(df.columns):
-            if col in NUMBERS:
-                ws.set_column(ix,ix,23,numeric_format)
-    return output.getvalue()
-
-def download_data(df, name, key):
-    st.download_button("📗 ดาวน์โหลด Excel",to_excel_bytes(df),f"{name}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",key=f"xlsx_{key}")
-    st.download_button("📥 ดาวน์โหลด CSV",df.to_csv(index=False).encode("utf-8-sig"),f"{name}.csv",mime="text/csv",key=f"csv_{key}")
-
-def display_table(table, prefix):
-    opts={col: st.column_config.NumberColumn(col,format="%.2f") for col in NUMBERS if col in table.columns}
-    st.dataframe(table,hide_index=True,use_container_width=True,column_config=opts)
-    download_data(table,prefix,prefix)
-
-# --- V3 Dashboard: Yield-first design with concise provenance ---
-YIELD_COL = "ผลผลิตต่อไร่ (กก./ไร่)"
-PRODUCTION_COL = "ผลผลิต (ตัน)"
-AREA_COL = "เนื้อที่เก็บเกี่ยว (ไร่)"
-FEATURED_CROPS = ["ข้าวนาปี", "ข้าวนาปรัง", "อ้อยโรงงาน", "มันสำปะหลังโรงงาน", "ยางพารา"]
-
-
-def valid_reference(value):
-    value = str(value or "").strip()
-    return value if re.match(r"^https?://[^\s]+$", value) else ""
-
-
-def source_short(row, level):
-    """Source classification derived from *the actual record*, never from the question."""
-    if level == "จังหวัด":
-        ref = str(row.get("อ้างอิง สศก.", "") or "").strip()
-        return "สศก." + (" · " + ref if ref else " · สถิติการเกษตร")
-    status = str(row.get("สถานะข้อมูล", "") or "")
-    method = str(row.get("วิธีได้มา", "") or "")
-    evidence = str(row.get("ประเภทหลักฐาน", "") or "")
-    if "พื้นที่เก็บเกี่ยวอำเภอ × ผลผลิตเฉลี่ยจังหวัด" in status or "ผลผลิตเฉลี่ยจังหวัด สศก." in method:
-        return "ประมาณการ · พื้นที่อำเภอ × ค่าเฉลี่ย สศก. จังหวัด"
-    if "อัตราผลผลิตคงที่" in status:
-        return "คำนวณ · อัตราคงที่ตามรายงานท้องถิ่น"
-    if "คำนวณรวมจากข้อมูลจริงรายอำเภอ" in status:
-        return "คำนวณรวม · จากเอกสารระดับอำเภอ"
-    if "สำนักงานเศรษฐกิจการเกษตร" in evidence or "สศก." in evidence:
-        return "สศก. · ข้อมูลระดับอำเภอ"
-    if "สำนักงานเกษตรจังหวัด" in evidence:
-        return "สำนักงานเกษตรจังหวัด · รายงานระดับอำเภอ"
-    if "สำนักงานสถิติจังหวัด" in evidence:
-        return "สำนักงานสถิติจังหวัด · ตารางรายอำเภอ"
-    if "การยางแห่งประเทศไทย" in evidence:
-        return "การยางแห่งประเทศไทย · รายงานรายอำเภอ"
-    if "สถิติตามรายงานรายอำเภอ" in evidence:
-        return "รายงานสถิติระดับอำเภอ"
-    return "เอกสารผลผลิตระดับอำเภอ (ดูแหล่งอ้างอิง)"
-
-
-def yield_source_short(row, level):
-    if level == "จังหวัด":
-        return "สศก. · " + str(row.get("อ้างอิง สศก.", "ตารางสถิติ"))
-    if "ค่าเฉลี่ยระดับจังหวัด สศก." in str(row.get("ประเภทผลผลิตต่อไร่", "")):
-        return ("สศก. ค่าเฉลี่ยจังหวัด · ปี " + str(row.get("ปีอ้างอิงผลผลิตต่อไร่", ""))
-                + " · " + str(row.get("อ้างอิงผลผลิตต่อไร่ สศก.", "")))
-    return "รายอำเภอ · จากผลผลิตและพื้นที่ในไฟล์เดิม"
-
-
-def prepare_dashboard_rows(df, level):
-    """Keep provincial kg/rai proxies distinguished from genuine district-derived values."""
-    frame = df.copy()
-    frame["ที่มา (สั้น)"] = frame.apply(lambda row: source_short(row, level), axis=1)
-    frame["ที่มาผลผลิตต่อไร่ (สั้น)"] = frame.apply(lambda row: yield_source_short(row, level), axis=1)
-    frame["เอกสารผลผลิตอำเภอ"] = frame.apply(lambda row: valid_reference(row.get("ลิงก์อ้างอิง", "")), axis=1)
-    def yield_url(row):
-        if level == "อำเภอ" and "ค่าเฉลี่ยระดับจังหวัด สศก." in str(row.get("ประเภทผลผลิตต่อไร่", "")):
-            return valid_reference(row.get("ลิงก์อ้างอิงผลผลิตต่อไร่ สศก.", ""))
-        return valid_reference(row.get("ลิงก์อ้างอิง", "")) or valid_reference(row.get("URL สศก.", ""))
-    frame["เอกสารอ้างอิง"] = frame.apply(yield_url, axis=1)
-    if level == "จังหวัด":
-        frame["พื้นที่แสดง"] = frame["จังหวัด"].astype(str)
-    else:
-        frame["พื้นที่แสดง"] = frame["อำเภอ"].astype(str) + " · " + frame["จังหวัด"].astype(str)
-    return frame
-
-
-def yield_summary_rows(frame, level):
-    """No false combined district yield when rows include OAE provincial proxies."""
-    if frame.empty:
-        return {"yield": None, "area": None, "production": None, "eligible": 0, "total": 0, "method": "ไม่มีข้อมูล"}
-    chosen=frame.loc[frame[AREA_COL].notna() & (frame[AREA_COL] > 0) & frame[PRODUCTION_COL].notna() & (frame[PRODUCTION_COL]>=0)].copy()
-    area = float(chosen[AREA_COL].sum()) if len(chosen) else None
-    production = float(chosen[PRODUCTION_COL].sum()) if len(chosen) else None
-    if level == "อำเภอ" and "ประเภทผลผลิตต่อไร่" in frame:
-        proxy=frame["ประเภทผลผลิตต่อไร่"].fillna("").str.contains("ค่าเฉลี่ยระดับจังหวัด สศก.",regex=False)
-        if proxy.any():
-            if proxy.all() and frame["จังหวัด"].nunique()==1 and frame["พืช"].nunique()==1 and frame[YIELD_COL].nunique()==1:
-                val=float(frame.iloc[0][YIELD_COL])
-                year=str(frame.iloc[0].get("ปีอ้างอิงผลผลิตต่อไร่", ""))
-                return {"yield":val,"area":area,"production":production,
-                        "eligible":len(chosen),"total":len(frame),
-                        "method":f"สศก. ค่าเฉลี่ยจังหวัด ปี {year} (ไม่ใช่อัตราที่สำรวจรายอำเภอ)"}
-            return {"yield":None,"area":area,"production":production,
-                    "eligible":len(chosen),"total":len(frame),
-                    "method":"ข้อมูลผสมกับค่าเฉลี่ยจังหวัด สศก. จึงไม่สรุปผลผลิตต่อไร่รวม"}
-    if level=="จังหวัด" and len(frame)==1 and pd.notna(frame.iloc[0].get(YIELD_COL)):
-        return {"yield":float(frame.iloc[0][YIELD_COL]),"area":area,"production":production,
-                "eligible":len(chosen),"total":len(frame),"method":"ผลผลิตต่อไร่ที่รายงานโดย สศก."}
-    if chosen.empty:
-        return {"yield":None,"area":area,"production":production,
-                "eligible":0,"total":len(frame),"method":"ไม่มีพื้นที่เก็บเกี่ยวสำหรับสรุป"}
-    yield_val=production*1000/area if area and area>0 else None
-    method="ผลผลิตต่อไร่เฉลี่ยถ่วงน้ำหนักที่ระบบคำนวณจากรายการที่เลือก"
-    return {"yield":yield_val,"area":area,"production":production,
-            "eligible":len(chosen),"total":len(frame),"method":method}
-
-
-def dashboard_number(value, unit="", decimals=2):
-    if value is None or pd.isna(value):
-        return "—"
-    return f"{float(value):,.{decimals}f}" + (" " + unit if unit else "")
-
-
-def render_metric_cards(stats, area_count, level):
-    # `safe` escapes dynamic display values before embedding them into HTML.
-    def card(label, value, unit, note, focused=False):
-        return (f'<div class="agri-kpi {"agri-kpi-main" if focused else ""}">'
-                f'<div class="agri-kpi-label">{html.escape(label)}</div>'
-                f'<div class="agri-kpi-value">{html.escape(dashboard_number(value))}'
-                f'<span>{html.escape(unit)}</span></div>'
-                f'<div class="agri-kpi-note">{html.escape(note)}</div></div>')
-    coverage = f"{stats['eligible']:,}/{stats['total']:,} รายการมีพื้นที่และผลผลิต"
-    method = stats["method"]
-    # Production/area totals are limited to records usable for a comparable kg/rai.
-    # Clearly say so, rather than labeling them as complete province totals.
-    html_cards = (
-        '<div class="agri-kpi-grid">'
-        + card("ผลผลิตต่อไร่ · ตัวชี้วัดหลัก", stats["yield"], "กก./ไร่", method, True)
-        + card("ผลผลิตจากรายการที่คำนวณได้", stats["production"], "ตัน", coverage)
-        + card("พื้นที่เก็บเกี่ยวที่ใช้คำนวณ", stats["area"], "ไร่", "ไม่รวมรายการที่ไม่มีพื้นที่เก็บเกี่ยว")
-        + card("รายการที่เปรียบเทียบได้", stats["eligible"], "รายการ", f"จากทั้งหมด {stats['total']:,} รายการ")
-        + '</div>'
-    )
-    st.markdown(html_cards, unsafe_allow_html=True)
-
-
-def plot_ranking(frame, metric, title, height_step=42, max_rows=12):
-    plot = frame.dropna(subset=[metric]).copy()
-    if metric==YIELD_COL and "อำเภอ" in plot.columns and "ประเภทผลผลิตต่อไร่" in plot:
-        proxy=plot["ประเภทผลผลิตต่อไร่"].fillna("").str.contains("ค่าเฉลี่ยระดับจังหวัด สศก.",regex=False)
-        if proxy.any():
-            st.caption("ℹ️ กราฟอันดับรายอำเภอไม่รวมค่าผลผลิตต่อไร่ที่ยืมค่าเฉลี่ยจังหวัด สศก.; ดูค่าดังกล่าวในตารางพร้อมอ้างอิง")
-            plot=plot.loc[~proxy].copy()
-    if plot.empty:
-        st.info(f"ยังไม่มีตัวเลข {metric} สำหรับตัวกรองที่เลือก")
-        return
-    plot = plot.sort_values(metric, ascending=False).head(max_rows).copy()
-    plot["ตัวเลข"] = plot[metric]
-    tip = [alt.Tooltip("พื้นที่แสดง:N", title="พื้นที่"),
-           alt.Tooltip("ตัวเลข:Q", title=metric, format=",.2f"),
-           alt.Tooltip("ปี:N", title="ปี"),
-           alt.Tooltip("ที่มาผลผลิตต่อไร่ (สั้น):N", title="ที่มาผลผลิตต่อไร่")]
-    bars = alt.Chart(plot).mark_bar(cornerRadiusEnd=6, size=19, color="#169675").encode(
-        y=alt.Y("พื้นที่แสดง:N", sort="-x", title=None,
-                axis=alt.Axis(labelLimit=260, labelFontSize=15, labelPadding=10)),
-        x=alt.X("ตัวเลข:Q", title=metric, axis=alt.Axis(format=",.0f", gridColor="#e5ece8"),
-                scale=alt.Scale(zero=True)), tooltip=tip,
-    )
-    st.altair_chart(bars.properties(height=min(480, max(260, len(plot)*height_step)), title=title), use_container_width=True)
-    if len(frame.dropna(subset=[metric])) > max_rows:
-        st.caption(f"กราฟแสดงสูงสุด {max_rows} อันดับ · ตารางด้านล่างมีข้อมูลครบ")
-
-
-def dashboard(district, province):
-    """V3 homepage: one crop & one exact year per comparison; provenance in each row."""
-    st.markdown('<div class="agri-eyebrow">AGRICULTURAL DATA INTELLIGENCE</div>', unsafe_allow_html=True)
-    st.markdown('## 📊 Dashboard ผลผลิตพืชเศรษฐกิจ')
-    st.caption("เจาะลึกผลผลิตต่อไร่ (กก./ไร่) พร้อมปีและแหล่งอ้างอิง · เลือกพืชและปีเดียวกันเพื่อเปรียบเทียบ")
-    sets = {name:df for name,df in (("จังหวัด",province),("อำเภอ",district)) if df is not None and not df.empty}
-    if not sets:
-        st.error("ไม่พบข้อมูลสำหรับ Dashboard")
-        return
-    total_prov = len(set().union(*(set(df["จังหวัด"].dropna()) for df in sets.values())))
-    all_districts = int(district[["จังหวัด","อำเภอ"]].drop_duplicates().shape[0]) if district is not None else 0
-    all_crops = len(set().union(*(set(df["พืช"].dropna()) for df in sets.values())))
-    total_records = sum(len(df) for df in sets.values())
-    st.caption(f"🗂️ ฐานข้อมูล: {total_prov:,} จังหวัด · {all_districts:,} อำเภอ · {all_crops:,} ชนิดพืช · {total_records:,} รายการ")
-
-    level = st.radio("เปรียบเทียบระดับข้อมูล", list(sets), key="v3_level_choice", horizontal=True)
-    raw = sets[level]
-    crops = sorted(raw["พืช"].dropna().astype(str).unique().tolist())
-    quick = [c for c in FEATURED_CROPS if c in crops]
-    st.markdown("**เลือกพืชเศรษฐกิจ**")
-    if quick:
-        buttons=st.columns(len(quick))
-        for i,crop_name in enumerate(quick):
-            if buttons[i].button(crop_name, key=f"crop_shortcut_{i}", use_container_width=True):
-                st.session_state["v3_crop_choice"] = crop_name
-                st.session_state.pop("v3_year_choice", None)
-                st.session_state.pop("v3_place_choice", None)
-                st.rerun()
-    if st.session_state.get("v3_crop_choice") not in crops:
-        st.session_state["v3_crop_choice"] = "ข้าวนาปี" if "ข้าวนาปี" in crops else crops[0]
-    a,b,c = st.columns([1.25,1,1.15])
-    with a:
-        crop = st.selectbox("ชนิดพืช", crops, key="v3_crop_choice")
-    crop_rows = raw.loc[raw["พืช"] == crop].copy()
-    years = sorted(crop_rows["ปี"].dropna().astype(str).unique().tolist(),
-                   key=lambda x: (int(re.search(r"25\d{2}|20\d{2}",x).group()) if re.search(r"25\d{2}|20\d{2}",x) else 0,x),reverse=True)
-    if not years:
-        st.info("ไม่พบปีข้อมูลสำหรับพืชนี้")
-        return
-    if st.session_state.get("v3_year_choice") not in years:
-        st.session_state["v3_year_choice"] = years[0]  # latest available crop year
-    with b:
-        year = st.selectbox("ปีข้อมูล / ฤดูเพาะปลูก", years, key="v3_year_choice")
-    same = crop_rows[crop_rows["ปี"].astype(str) == year].copy()
-    places = ["ทุกจังหวัด" if level=="จังหวัด" else "ทุกอำเภอ"] + sorted(same["จังหวัด"].dropna().astype(str).unique().tolist())
-    if st.session_state.get("v3_place_choice") not in places:
-        st.session_state["v3_place_choice"] = places[0]
-    with c:
-        province_choice = st.selectbox("พื้นที่ที่ต้องการดู", places, key="v3_place_choice")
-    if province_choice not in ("ทุกจังหวัด", "ทุกอำเภอ"):
-        same = same[same["จังหวัด"] == province_choice].copy()
-    result = prepare_dashboard_rows(same,level)
-    if result.empty:
-        st.warning("ไม่พบข้อมูลที่ตรงเงื่อนไข")
-        return
-
-    # Source captions are short and tied to actual rows, not a blanket claim that
-    # district data comes from OAE. Distinguish estimates from published district rows.
-    st.markdown("#### 📏 ผลผลิตต่อไร่ — ตัวเลขสำคัญ")
-    st.caption("ค่ารายจังหวัดนำตรงจากตาราง สศก. · รายอำเภอที่ขาดค่าจะใช้ค่าเฉลี่ยจังหวัด สศก. เป็นข้อมูลประกอบ โดยระบุปีและที่มาชัดเจน")
-    stats = yield_summary_rows(result, level)
-    render_metric_cards(stats, len(result), level)
-    kinds = result["ที่มา (สั้น)"].value_counts().index.tolist()
-    if level == "จังหวัด":
-        st.caption("📚 ที่มา: สำนักงานเศรษฐกิจการเกษตร (สศก.) · ดูเลขตารางและลิงก์เอกสารในตารางด้านล่าง"
-                   + (" · ค่าเฉลี่ยรวมหลายจังหวัดระบบคำนวณถ่วงน้ำหนัก" if len(result)>1 else ""))
-    else:
-        desc = " · ".join(kinds[:3])
-        st.caption(f"📚 **ที่มา:** {desc}" + (" · ดูรายละเอียดรายอำเภอในตาราง" if len(kinds)>3 else ""))
-        proxy=result["ประเภทผลผลิตต่อไร่"].fillna("").str.contains("ค่าเฉลี่ยระดับจังหวัด สศก.",regex=False)
-        if proxy.any():
-            st.info(f"**{proxy.sum():,} รายการ** แสดง **ค่าเฉลี่ยระดับจังหวัดจาก สศก.** เพื่อประกอบข้อมูลรายอำเภอ (ไม่ใช่การสำรวจรายอำเภอ) และอาจอ้างอิงคนละปีกับผลผลิตรายอำเภอ")
-        if stats["eligible"] < stats["total"]:
-            st.caption(f"รายการที่มีพื้นที่เก็บเกี่ยวระดับอำเภอครบ: {stats['eligible']:,}/{stats['total']:,} · ส่วนที่ขาดพื้นที่ไม่ได้สมมติตัวเลขขึ้นใหม่")
-    # Never treat absent provincial crop records as zero production.
-    if level=="จังหวัด" and province_choice=="ทุกจังหวัด":
-        all_provinces=set(province["จังหวัด"].astype(str).unique()) if province is not None else set()
-        absent=sorted(all_provinces - set(same["จังหวัด"].astype(str).unique()))
-        if absent:
-            st.info(f"ไม่มีข้อมูล {crop} ปี {year} สำหรับ: {', '.join(absent)} (ไม่ได้หมายถึงผลผลิต 0)")
-
-    st.markdown("#### 🏆 จัดอันดับผลผลิตต่อไร่")
-    st.caption(f"{crop} · ปีข้อมูลรายอำเภอ/จังหวัด {year} · ระดับ{level} — ค่าที่มาจากค่าเฉลี่ยจังหวัดไม่ถูกใช้จัดอันดับอำเภอ")
-    if result["พื้นที่แสดง"].duplicated().any():
-        st.warning("พบรายการซ้ำในพื้นที่เดียวกัน ระบบไม่รวมรายการซ้ำ กรุณาตรวจสอบในเมนูคุณภาพข้อมูล")
-    plot_ranking(result, YIELD_COL, "ผลผลิตต่อไร่ (กก./ไร่)")
-
-    st.markdown("#### 📊 ผลผลิตรวมและพื้นที่เก็บเกี่ยว")
-    left,right=st.columns(2)
-    with left:
-        plot_ranking(result, PRODUCTION_COL, "ผลผลิตรวม (ตัน)", 30, 10)
-    with right:
-        plot_ranking(result, AREA_COL, "เนื้อที่เก็บเกี่ยว (ไร่)",30,10)
-    st.caption("กราฟเปรียบเทียบจากข้อมูลแต่ละรายการ ไม่รวมข้ามชนิดพืชหรือข้ามปี และไม่ใช้ยอดจังหวัดแทนยอดอำเภอ")
-
-    st.markdown("#### 📋 ตารางข้อมูลและแหล่งอ้างอิง")
-    st.caption("ที่มาระบุแยกรายการ ไม่เหมารวมค่าประมาณการเป็นข้อมูลที่รายงานโดยตรง · เลือกเปิดเอกสารได้")
-    show_columns=["จังหวัด"] + (["อำเภอ"] if level=="อำเภอ" else []) + [
-        "พืช","ปี",YIELD_COL,PRODUCTION_COL,AREA_COL,"ที่มาผลผลิตต่อไร่ (สั้น)","ที่มา (สั้น)","เอกสารอ้างอิง"]
-    if "ปีเพาะปลูก" in result.columns:
-        show_columns.insert(4,"ปีเพาะปลูก")
-    if "ปีอ้างอิงผลผลิตต่อไร่" in result.columns:
-        show_columns.insert(show_columns.index(YIELD_COL)+1, "ปีอ้างอิงผลผลิตต่อไร่")
-    if "อ้างอิงผลผลิตต่อไร่ สศก." in result.columns:
-        show_columns.append("อ้างอิงผลผลิตต่อไร่ สศก.")
-    if "เอกสารผลผลิตอำเภอ" in result.columns and level=="อำเภอ":
-        show_columns.append("เอกสารผลผลิตอำเภอ")
-    table=result[show_columns].copy()
-    # Ranking for district with missing area should not show fake zero yield.
-    table=table.sort_values(YIELD_COL,ascending=False,na_position="last",kind="stable")
-    fmt={col:st.column_config.NumberColumn(col,format="%.2f") for col in NUMBERS if col in table}
-    fmt["เอกสารอ้างอิง"]=st.column_config.LinkColumn("เอกสารอ้างอิงผลผลิตต่อไร่",display_text="เปิดเอกสาร")
-    if "เอกสารผลผลิตอำเภอ" in table:
-        fmt["เอกสารผลผลิตอำเภอ"]=st.column_config.LinkColumn("เอกสารผลผลิตอำเภอ",display_text="เปิดเอกสาร")
-    st.dataframe(table,hide_index=True,use_container_width=True,column_config=fmt)
-    xls_col,csv_col=st.columns(2)
-    with xls_col:
-        st.download_button("📗 ดาวน์โหลด Excel พร้อมแหล่งอ้างอิง",to_excel_bytes(result),
-                           f"agridata_{level}_{crop}_{year}.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                           key="v3_dashboard_excel",use_container_width=True)
-    with csv_col:
-        st.download_button("📥 ดาวน์โหลด CSV",result.to_csv(index=False).encode("utf-8-sig"),
-                           f"agridata_{level}_{crop}_{year}.csv",mime="text/csv",
-                           key="v3_dashboard_csv",use_container_width=True)
-    with st.expander("ℹ️ วิธีอ่านผลผลิตต่อไร่และแหล่งข้อมูล"):
-        st.markdown("**ระดับจังหวัด:** แสดงผลผลิตต่อไร่ตามเอกสาร สศก. เมื่อเลือกหลายจังหวัด ตัวเลขสรุปด้านบนเป็นค่าเฉลี่ยถ่วงน้ำหนักที่ระบบคำนวณจากผลผลิตและพื้นที่ของรายการที่เลือก ไม่ใช่ตัวเลขที่ สศก. รายงานรวมให้ 8 จังหวัด")
-        st.markdown("**ระดับอำเภอ:** ค่าที่มีอยู่ในไฟล์เดิมเก็บไว้ตามเดิม ส่วนค่า กก./ไร่ ที่ขาดให้ใช้ผลผลิตเฉลี่ยระดับจังหวัดตามรายงาน สศก. โดยไม่คำนวณขึ้นใหม่ และระบุปีอ้างอิงต่างหาก")
-        st.markdown("**ข้อควรระวัง:** ค่าเฉลี่ยจังหวัดที่นำมาแสดงคู่รายอำเภอไม่ใช่ค่าเฉลี่ยที่สำรวจในอำเภอนั้น หากพื้นที่เก็บเกี่ยวรายอำเภอไม่มีต้นฉบับจะไม่สร้างตัวเลขแทน")
-
-# --- V3.1: conversational assistant first, analysis dashboard immediately below ---
-
-def handle_user_question(question, district_data, province_data):
-    if "chat" not in st.session_state:
-        st.session_state.chat = []
-    if "dialog_context" not in st.session_state:
-        st.session_state.dialog_context = {}
-    st.session_state.chat.append({"role": "user", "text": question})
-    prior_coverage = st.session_state.dialog_context.get("last_intent") == "coverage"
-    resolved, followup, context = build_conversational_query(
-        question, st.session_state.dialog_context, district_data, province_data
-    )
-    st.session_state.dialog_context = context
-    if is_coverage_question(question, prior_coverage):
-        reply, table, metric = coverage_answer(question, district_data, province_data), None, None
-        st.session_state.dialog_context["last_intent"] = "coverage"
-    elif followup is not None:
-        reply, table, metric = followup, None, None
-    elif context.get("rice_both") and rice_is_generic(resolved):
-        reply, table, metric = answer_both_rice(resolved, district_data, province_data)
-    elif context.get("rice_both") and not context.get("crop") and not any(
-        x in question for x in ("นาปี", "นาปรัง")
-    ):
-        reply, table, metric = answer_both_rice(resolved + " ข้าว", district_data, province_data)
-    else:
-        reply, table, metric = answer(resolved, district_data, province_data)
-    if not is_coverage_question(question, prior_coverage):
-        st.session_state.dialog_context.pop("last_intent", None)
-    st.session_state.chat.append({"role": "assistant", "text": with_yield_note(reply, table), "table": table})
-
-
-def show_chat(district_data, province_data):
-    st.markdown('<div class="agri-section-label">01 / ASK AGRI</div>', unsafe_allow_html=True)
-    st.markdown('## 💬 ถามข้อมูลพืชเศรษฐกิจได้เลย')
-    st.markdown('<p class="agri-subtitle">พิมพ์คำถามสั้น ๆ ได้เหมือนคุยกับเจ้าหน้าที่ เช่น “อ้อยจังหวัดขอนแก่น” หรือ “ขอรายอำเภอด้วย”</p>', unsafe_allow_html=True)
-    if "chat" not in st.session_state:
-        st.session_state.chat = []
-    if "dialog_context" not in st.session_state:
-        st.session_state.dialog_context = {}
-
-    examples = [
-        ("🌾 ข้าวขอนแก่น", "ข้าวจังหวัดขอนแก่น"),
-        ("🌱 อ้อยอุดรธานี", "ผลผลิตอ้อยจังหวัดอุดรธานี"),
-        ("📏 ผลผลิตต่อไร่", "ผลผลิตต่อไร่ข้าวนาปีจังหวัดขอนแก่น"),
-        ("📍 รายอำเภอ", "ข้าวนาปีรายอำเภอจังหวัดกาฬสินธุ์"),
-    ]
-    # Two rows of large, easy-to-tap suggestion buttons remain readable on phones.
-    preset = None
-    for start in (0, 2):
-        suggestion_cols = st.columns(2)
-        for offset, (label, example_question) in enumerate(examples[start:start + 2]):
-            with suggestion_cols[offset]:
-                if st.button(label, key=f"chat_example_{start + offset}", use_container_width=True):
-                    preset = example_question
-
-    with st.container(height=500, border=True, key="agri_chat_history"):
-        if not st.session_state.chat:
-            st.markdown("#### 👋 สวัสดีครับ ยินดีต้อนรับสู่ AgriData AI")
-            st.markdown("ถามข้อมูลการเกษตรได้ทั้ง **ระดับจังหวัด** และ **รายอำเภอ** จากฐานข้อมูล 8 จังหวัด")
-            st.markdown("**คำถามตัวอย่าง**: _ผลผลิตอ้อยขอนแก่นเป็นเท่าไหร่?_  หรือ  _อำเภอไหนมีผลผลิตต่อไร่สูงที่สุด?_ ")
-            st.info("📚 คำตอบอ้างอิงข้อมูลที่มีอยู่ในฐานข้อมูล พร้อมปีและที่มาของตัวเลข")
-        else:
-            last_index = len(st.session_state.chat) - 1
-            for idx, msg in enumerate(st.session_state.chat):
-                with st.chat_message(msg["role"]):
-                    st.markdown(msg["text"])
-                    data = msg.get("table")
-                    if data is not None and not data.empty:
-                        expanded = idx == last_index
-                        with st.expander(f"📊 ตารางข้อมูล {len(data):,} รายการ และดาวน์โหลด", expanded=expanded):
-                            display_table(data, f"home_chat_{idx}")
-    # Explicit nested container keeps the composer INLINE, before the Dashboard,
-    # instead of Streamlit's normal bottom-of-page floating chat composer.
-    with st.container(key="agri_chat_composer"):
-        question = st.chat_input("ถามข้อมูลได้เลย เช่น ผลผลิตต่อไร่อ้อยจังหวัดขอนแก่น…", key="agri_chat_question")
-    left, right = st.columns([3.5, 1])
-    with left:
-        st.caption("💡 ถามต่อได้โดยไม่ต้องพิมพ์จังหวัดหรือชื่อพืชซ้ำ")
-    with right:
-        if st.button("🧹 ล้างแชท", key="clear_chat_home", use_container_width=True):
-            st.session_state.chat = []
-            st.session_state.dialog_context = {}
-            st.rerun()
-    if not secret("GEMINI_API_KEY"):
-        st.caption("ℹ️ ระบบค้นหาจากฐานข้อมูลได้แม้ยังไม่เชื่อม Gemini; คำถามซับซ้อนอาจมีข้อจำกัด")
-    chosen = preset or question
-    if chosen and str(chosen).strip():
-        if district_data is None or province_data is None:
-            st.error("กรุณาอัปโหลด data.csv และ province_data.csv เพื่อเปิดการสนทนา")
-        else:
-            handle_user_question(str(chosen).strip(), district_data, province_data)
-            st.rerun()
-
 
 st.markdown("""<style>
-@import url('https://fonts.googleapis.com/css2?family=Prompt:wght@400;500;600;700;800&display=swap');
-:root {--agri-green:#17644d;--agri-green-soft:#e7f4ed;--agri-border:#d9e4dd;}
-html, body, [data-testid="stAppViewContainer"], [data-testid="stSidebar"],
-[data-testid="stAppViewContainer"] button, [data-testid="stAppViewContainer"] input,
-[data-testid="stAppViewContainer"] textarea {
- font-family:'Prompt','Noto Sans Thai',Tahoma,sans-serif !important;
-}
-.block-container {max-width:1320px; padding-top:1.4rem; padding-bottom:5rem;}
-[data-testid="stMarkdownContainer"] p, [data-testid="stMarkdownContainer"] li {
- font-size:1.075rem; line-height:1.8; letter-spacing:.002em;
-}
-[data-testid="stMarkdownContainer"] h2 {font-size:clamp(1.55rem,2.6vw,2rem); font-weight:750; letter-spacing:-.02em; line-height:1.42;}
-[data-testid="stMarkdownContainer"] h3 {font-size:1.33rem; font-weight:700; line-height:1.55;}
-[data-testid="stWidgetLabel"] p, [data-testid="stSelectbox"] label p, [data-testid="stRadio"] label p {
- font-size:1.045rem !important; font-weight:600;
-}
-[data-testid="stCaptionContainer"] p, .stCaption p {
- font-size:.95rem !important; line-height:1.7 !important;
-}
-[data-testid="stButton"] button {min-height:3rem; border-radius:12px; font-size:1.02rem; font-weight:600;}
-[data-testid="stDownloadButton"] button {font-size:1rem; min-height:3rem; border-radius:12px;}
-[data-testid="stChatMessage"] {padding:1.05rem 1.1rem; border-radius:14px;}
-[data-testid="stChatMessage"] p {font-size:1.075rem !important; line-height:1.75 !important;}
-/* Inline message composer above Dashboard, not the bottom-of-viewport sticky composer */
-.st-key-agri_chat_composer [data-testid="stChatInput"] {margin-top:13px; margin-bottom:4px;}
-.st-key-agri_chat_composer textarea {font-size:1.17rem !important; line-height:1.5 !important; min-height:70px !important; padding-top:17px !important;}
-.st-key-agri_chat_composer [data-testid="stChatInput"] > div {border-radius:16px; border-width:2px;}
-.st-key-agri_chat_history {border-radius:18px;}
-.agri-hero {border-radius:22px; padding:28px 32px; margin-bottom:24px;
- background:linear-gradient(115deg,#0c473a 0%,#166b50 60%,#27856c 100%); color:#fff;
- box-shadow:0 8px 24px rgba(5,55,35,.12);}
-.agri-title {font-size:clamp(2rem,4vw,3rem);font-weight:800;letter-spacing:-.04em;line-height:1.35;}
-.agri-lead {font-size:clamp(1.03rem,1.8vw,1.23rem);color:#e1f4e9;margin-top:6px;line-height:1.7;}
-.agri-eyebrow, .agri-section-label {font-size:.84rem;font-weight:800;letter-spacing:.14em;color:#1f8668;margin:9px 0 7px;}
-.agri-subtitle {font-size:1.06rem !important;line-height:1.65;color:inherit;opacity:.85;margin:0 0 15px;}
-.agri-dash-spacer {border-top:1px solid var(--agri-border);margin:37px 0 27px;}
-.agri-kpi-grid {display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:13px;margin:16px 0 18px;}
-.agri-kpi {min-width:0;border-radius:16px;border:1px solid #cfe0d4;background:#f7fbf8;padding:19px 16px;}
-.agri-kpi-main {background:linear-gradient(150deg,#d6f1de,#edf9ee);border:2px solid #7db693;}
-.agri-kpi-label {font-size:1rem;font-weight:650;color:#315843;line-height:1.4;}
-.agri-kpi-value {font-weight:800;font-variant-numeric:tabular-nums;color:#16593b;font-size:clamp(1.4rem,2.25vw,2.15rem);margin:9px 0 6px;overflow-wrap:anywhere;}
-.agri-kpi-value span {font-size:.84rem;font-weight:650;white-space:nowrap;}
-.agri-kpi-note {font-size:.88rem;line-height:1.65;color:#52705d;}
-[data-testid="stDataFrame"] {border-radius:12px;overflow:hidden;}
-@media(max-width:920px) {.agri-kpi-grid {grid-template-columns:repeat(2,minmax(0,1fr));}}
-@media(max-width:610px) {
- .block-container {padding-top:1rem;}
- .agri-hero {padding:22px 19px;border-radius:16px;}
- .agri-title {font-size:2rem;}
- .agri-kpi-grid {gap:8px;}
- .agri-kpi {padding:13px 11px;}
- .agri-kpi-value {font-size:1.35rem;}
- .agri-kpi-label {font-size:.9rem;}
- .agri-kpi-note {font-size:.8rem;}
- [data-testid="stButton"] button {font-size:.9rem;}
-}
-@media(prefers-color-scheme:dark) {
- .agri-kpi {background:#1e352a;border-color:#425d4b;}
- .agri-kpi-main {background:#234632;border-color:#6fb48b;}
- .agri-kpi-label,.agri-kpi-note {color:#c2e0ca;}
- .agri-kpi-value {color:#f0fff2;}
- .agri-eyebrow,.agri-section-label {color:#9bdab8;}
- .agri-dash-spacer {border-color:#425c4e;}
-}
+@import url('https://fonts.googleapis.com/css2?family=Prompt:wght@400;500;600;700&display=swap');
+html,body,[class*="css"],.stApp,button,input,select,textarea {font-family:'Prompt',sans-serif!important;}
+.block-container {max-width:1280px;padding-top:1.15rem;padding-bottom:3rem;}
+p,li,div[data-testid="stMarkdownContainer"] {font-size:1.05rem;line-height:1.72;}
+.stButton>button,.stDownloadButton>button {font-size:1.04rem!important;min-height:44px;}
+input {font-size:1.08rem!important;}
+.agri-hero {padding:22px 25px;border-radius:20px;background:linear-gradient(110deg,#12573c,#20825c);color:#fff;margin-bottom:18px;}
+.agri-hero h1 {color:#fff;font-size:2.1rem;margin:0 0 3px 0;}
+.agri-hero p {color:#effff6;margin:0;font-size:1.03rem;}
+.agri-note {background:#eaf6ee;padding:11px 15px;border-radius:12px;border-left:4px solid #209266;margin-top:9px;}
+[data-testid="stMetricValue"] {font-size:1.8rem;}
 </style>""", unsafe_allow_html=True)
-st.markdown("""<div class="agri-hero">
-<div class="agri-title">🌾 AgriData AI <span style="font-size:.34em;vertical-align:middle;opacity:.8;font-weight:600">V3.3</span></div>
-<div class="agri-lead">ผู้ช่วยค้นหาและวิเคราะห์ผลผลิตพืชเศรษฐกิจรายจังหวัดและอำเภอ<br>ถามได้ทันที · ผลผลิตต่อไร่ชัดเจน · พร้อมปีข้อมูลและแหล่งอ้างอิง</div>
-</div>""", unsafe_allow_html=True)
-password = secret("APP_PASSWORD")
-if password and not st.session_state.get("auth"):
-    with st.form("login"):
-        value = st.text_input("รหัสผ่าน", type="password")
-        if st.form_submit_button("เข้าสู่ระบบ"):
-            if hmac.compare_digest(value, password):
-                st.session_state.auth = True
-                st.rerun()
-            else:
-                st.error("รหัสผ่านไม่ถูกต้อง")
-    st.stop()
-district = data_for("อำเภอ")
-province = data_for("จังหวัด")
-if district is None and province is None:
-    st.error("ไม่พบ data.csv และ province_data.csv ใน GitHub")
-    st.stop()
-with st.sidebar:
-    st.header("🗃️ ข้อมูลที่มีในระบบ")
-    for level, frame in (("อำเภอ", district), ("จังหวัด", province)):
-        if frame is not None:
-            st.metric(level, f"{len(frame):,} รายการ")
-            st.caption(f"{frame['จังหวัด'].nunique()} จังหวัด · {frame['พืช'].nunique()} ชนิดพืช")
-    if st.button("🔄 โหลด CSV ใหม่"):
-        load_csv.clear()
-        st.rerun()
-    st.caption("ฐานข้อมูล CSV จาก GitHub · คงตัวเลขผลผลิตรายอำเภอเดิม และเติมเฉพาะค่าผลผลิตต่อไร่ที่ขาดจากค่าเฉลี่ยจังหวัด สศก.")
 
-home_tab, quality_tab, source_tab = st.tabs(["🏠 หน้าแรก · แชทและ Dashboard", "🛡️ ตรวจสอบคุณภาพ", "📚 ข้อมูลต้นฉบับ"])
-with home_tab:
-    show_chat(district, province)
-    st.markdown('<div class="agri-dash-spacer"></div><div class="agri-section-label">02 / DASHBOARD</div>', unsafe_allow_html=True)
-    dashboard(district, province)
-with quality_tab:
-    st.subheader("🛡️ ตรวจสอบความครบถ้วนและความสอดคล้อง")
-    all_issues = pd.concat([audit(d, l) for l, d in (("อำเภอ", district), ("จังหวัด", province)) if d is not None], ignore_index=True)
-    st.metric("ข้อสังเกตที่ต้องตรวจทาน", len(all_issues))
-    st.caption("ตรวจสอบโครงสร้างและการคำนวณ ไม่ใช่การรับรองข้อมูลกับ PDF สศก. ทุกบรรทัด")
-    if all_issues.empty:
-        st.success("ไม่พบประเด็นตามกฎตรวจสอบที่กำหนด")
+
+def secret(name):
+    try:
+        return str(st.secrets.get(name, ""))
+    except (KeyError, FileNotFoundError):
+        return ""
+
+
+app_password=secret("APP_PASSWORD")
+if app_password:
+    entered=st.text_input("รหัสผ่านเข้าใช้ระบบ",type="password")
+    if not hmac.compare_digest(entered,app_password):
+        st.info("กรุณาใส่รหัสผ่านเพื่อเข้าใช้งาน")
+        st.stop()
+
+@st.cache_data(show_spinner=False)
+def load_csv(filename,size,mtime):
+    df=pd.read_csv(BASE/filename,encoding="utf-8-sig",dtype=str,keep_default_na=False)
+    nums=[x for x in df.columns if x.endswith(('(ตัน)','(ไร่)','(กก./ไร่)'))]
+    for col in nums:
+        df[col]=pd.to_numeric(df[col].astype(str).str.replace(',','',regex=False),errors='coerce')
+    return df
+
+
+def get_data(filename):
+    path=BASE/filename
+    if not path.is_file():
+        st.error(f"ไม่พบไฟล์ {filename} ใน GitHub")
+        st.stop()
+    return load_csv(filename,path.stat().st_size,path.stat().st_mtime_ns)
+
+province=get_data('province_data.csv')
+district=get_data('data.csv')
+CROP_P='พืช'; PROV='จังหวัด'
+PROD='ผลผลิต (ตัน)'; AREA='พื้นที่เก็บเกี่ยว (ไร่)'; YIELD='ผลผลิตต่อไร่ (กก./ไร่)'
+DPROD='ผลผลิตรายอำเภอ (ตัน)'; DAREA='พื้นที่เก็บเกี่ยวอำเภอ (ไร่)'
+REFYIELD='ผลผลิตเฉลี่ยจังหวัด สศก. (กก./ไร่)'
+
+PROVINCE_NAMES={
+ 'อุดรธานี':['อุดรธานี','อุดร'],'หนองบัวลำภู':['หนองบัวลำภู','หนองบัว'],
+ 'หนองคาย':['หนองคาย'],'ขอนแก่น':['ขอนแก่น'],
+ 'กาฬสินธุ์':['กาฬสินธุ์','กาฬ'],'บึงกาฬ':['บึงกาฬ'],
+ 'มหาสารคาม':['มหาสารคาม','มหาสาร'],'สกลนคร':['สกลนคร','สกล']}
+CROP_NAMES={
+ 'ข้าวนาปี':['ข้าวนาปี','นาปี'],'ข้าวนาปรัง':['ข้าวนาปรัง','นาปรัง'],
+ 'อ้อยโรงงาน':['อ้อยโรงงาน','อ้อย'],'มันสำปะหลังโรงงาน':['มันสำปะหลังโรงงาน','มันสำปะหลัง','มัน'],
+ 'ยางพารา':['ยางพารา','ยาง'],'ปาล์มน้ำมัน':['ปาล์มน้ำมัน','ปาล์ม'],
+ 'ข้าวโพดเลี้ยงสัตว์':['ข้าวโพดเลี้ยงสัตว์','ข้าวโพด']}
+
+
+def compact(q):
+    return re.sub(r'\s+','',str(q)).replace('จังหวัด','').replace('จ.','')
+
+
+def detect_province(q):
+    norm=compact(q)
+    hits=[]; occupied=[]
+    aliases=sorted([(al,p) for p,als in PROVINCE_NAMES.items() for al in als],key=lambda x:len(x[0]),reverse=True)
+    for al,p in aliases:
+        idx=norm.find(al)
+        if idx>=0 and not any(max(idx,a)<min(idx+len(al),b) for a,b in occupied):
+            if p not in hits: hits.append(p)
+            occupied.append((idx,idx+len(al)))
+    return hits
+
+
+def detect_crops(q):
+    s=compact(q)
+    full=[]
+    for crop,words in CROP_NAMES.items():
+        if any(w in s for w in words):full.append(crop)
+    if ('ข้าว' in s) and not any(x.startswith('ข้าวนา') for x in full):
+        full.extend(['ข้าวนาปี','ข้าวนาปรัง'])
+    return list(dict.fromkeys(full))
+
+
+def is_rice_ambiguous(q,cs):
+    s=compact(q)
+    return 'ข้าว' in s and len(cs)==2 and set(cs)=={'ข้าวนาปี','ข้าวนาปรัง'}
+
+
+def fmt(x,dec=2):
+    return 'ไม่พบข้อมูล' if pd.isna(x) else f'{x:,.{dec}f}'
+
+
+def tidy_table(df, cols):
+    z=df[cols].copy()
+    num=z.select_dtypes(include='number').columns
+    for col in num:
+        z[col]=z[col].map(lambda x:fmt(x))
+    return z
+
+
+def as_csv(df):
+    return df.to_csv(index=False,encoding='utf-8-sig').encode('utf-8-sig')
+
+
+def title_prov(rows):
+    return '、'.join(rows) if rows else '8 จังหวัด'
+
+
+def respond(question):
+    s=compact(question)
+    ctx=st.session_state.setdefault('agri_context',{'provinces':[],'crops':[],'level':'จังหวัด','coverage':False})
+    provinces=detect_province(question)
+    crops=detect_crops(question)
+    all_n= len(set(province['จังหวัด']))
+    is_coverage=bool(re.search(r'มีข้อมูล|มีอะไรบ้าง|มีไหม|รู้จัก|ครอบคลุม',s))
+    short_followup=('ด้วย' in s or s in ('ต่อ','แล้วหนองบัว','ขอนแก่น','อุดร','อุดรธานี','หนองบัว','นาปี','นาปรัง'))
+    if not provinces and short_followup and not is_coverage:provinces=ctx['provinces'][:]
+    if not crops and not is_coverage and short_followup:
+        crops=ctx['crops'][:]
+    if ctx.get('coverage') and 'ด้วย' in s and provinces:is_coverage=True
+    level='อำเภอ' if any(w in s for w in ['รายอำเภอ','แต่ละอำเภอ','อำเภอไหน','แยกอำเภอ']) else ('จังหวัด' if 'ระดับจังหวัด' in s else ctx['level'] if short_followup and not is_coverage else 'จังหวัด')
+    if 'จังหวัดไหน' in s or 'กี่จังหวัด' in s:provinces=[]
+    if provinces:ctx['provinces']=provinces
+    if crops:ctx['crops']=crops
+    ctx['level']=level
+    ctx['coverage']=is_coverage
+    years=re.findall(r'25\d{2}',s)
+    years=list(dict.fromkeys(years))
+    if is_coverage and not any(w in s for w in ['ผลิต','ผลผลิต','พื้นที่เก็บเกี่ยว']):
+        if ('จังหวัดไหน' in s or 'กี่จังหวัด' in s or 'ทั้งหมด' in s or not provinces):
+            return f'✅ มีข้อมูล **{all_n} จังหวัด** ได้แก่ '+', '.join(sorted(province['จังหวัด'].unique()))+'',None,'จังหวัด'
+        lines=[]
+        for p in provinces:
+            pv=province[province['จังหวัด']==p]
+            di=district[district['จังหวัด']==p]
+            valid=di[DPROD].notna()
+            lines.append(f'✅ **{p}**: ข้อมูลจังหวัด {len(pv)} พืช, รายการอำเภอ×พืช {len(di)} แถว (มีผลผลิตรายอำเภอ {valid.sum()} แถว)')
+        return '\n\n'.join(lines),None,'จังหวัด'
+    if 'ข้าว' in s and not crops:crops=['ข้าวนาปี','ข้าวนาปรัง']
+    if not crops:
+        if provinces:
+            names=', '.join(province[province['จังหวัด'].isin(provinces)]['พืช'].unique())
+            return f'มีข้อมูล **{title_prov(provinces)}** ครับ ชนิดพืชที่มี: {names}\n\nลองถาม เช่น “ผลผลิตอ้อยอุดร” หรือ “ข้าวขอนแก่น”',None,'จังหวัด'
+        return 'ลองถาม “อ้อยอุดร” “ข้าวขอนแก่น” หรือ “มีข้อมูลจังหวัดไหนบ้าง” ได้เลยครับ',None,'จังหวัด'
+    if not provinces and is_rice_ambiguous(question,crops) and 'จัดอันดับ' not in s and not any(w in s for w in ['มากที่สุด','สูงสุด']):
+        return 'ต้องการ **ข้าวนาปี** หรือ **ข้าวนาปรัง** ครับ? หรือระบุจังหวัด เช่น “ข้าวขอนแก่น” เพื่อดูทั้งสองประเภทแยกกัน',None,'จังหวัด'
+    if is_rice_ambiguous(question,crops) and any(w in s for w in ['มากที่สุด','สูงสุด','อันดับ']):
+        return 'ต้องการจัดอันดับ **ข้าวนาปี** หรือ **ข้าวนาปรัง** ครับ? เพื่อไม่เปรียบเทียบข้อมูลคนละฤดู',None,'จังหวัด'
+    if level=='อำเภอ' and not provinces:
+        return 'ต้องการข้อมูลรายอำเภอของ **จังหวัดไหน** ครับ? เช่น “อ้อยรายอำเภออุดร”',None,'อำเภอ'
+    if level=='จังหวัด':
+        df=province[province['พืช'].isin(crops)]
+        if provinces:df=df[df['จังหวัด'].isin(provinces)]
+        if years:df=df[df['ปีสถิติ'].astype(str).isin(years)]
+        if df.empty:
+            avail=province[province['พืช'].isin(crops)]
+            return f'ไม่พบข้อมูลตามเงื่อนไขนี้ (ปีที่มีในฐานสำหรับพืชนี้: {", ".join(sorted(set(avail["ปีสถิติ"].astype(str))))})',None,'จังหวัด'
+        comparison=any(w in s for w in ['มากที่สุด','สูงสุด','อันดับ','เทียบ','เปรียบเทียบ'])
+        if comparison and len(df['ปีสถิติ'].unique())>1:
+            return 'ข้อมูลมีคนละปีสถิติ กรุณาระบุ **ปีเดียวกัน** ก่อนจัดอันดับครับ',None,'จังหวัด'
+        if comparison and len(df['พืช'].unique())>1:
+            return 'กรุณาเลือก **พืชชนิดเดียวกัน** ก่อนจัดอันดับครับ',None,'จังหวัด'
+        if comparison:
+            measure=YIELD if 'ต่อไร่' in s else AREA if 'พื้นที่' in s else PROD
+            df=df.sort_values(measure,ascending=False)
+        else:df=df.sort_values(['จังหวัด','พืช'])
+        t=df[['จังหวัด','พืช','ปีสถิติ','ผลผลิต (ตัน)','พื้นที่เก็บเกี่ยว (ไร่)','ผลผลิตต่อไร่ (กก./ไร่)','อ้างอิงตาราง/หน้า']]
+        intro=f'**ผลข้อมูลระดับจังหวัด** · {title_prov(provinces)} · {", ".join(crops)} · {len(df)} รายการ\n\n'
+        lines=[]
+        for _,r in df.head(8).iterrows():
+            lines.append(f'**{r["จังหวัด"]} · {r["พืช"]} · ปี {r["ปีสถิติ"]}** — ผลผลิต **{fmt(r[PROD])} ตัน** · ผลผลิตต่อไร่ **{fmt(r[YIELD])} กก./ไร่** · พื้นที่ **{fmt(r[AREA])} ไร่**  \nที่มา: สศก. {r["อ้างอิงตาราง/หน้า"]} ([ต้นฉบับ]({r["ลิงก์ สศก."]}))')
+        return intro+'\n\n'.join(lines)+('\n\nมีข้อมูลเพิ่มเติมในตาราง' if len(df)>8 else ''),t,'จังหวัด'
+    df=district[district['พืช'].isin(crops)]
+    df=df[df['จังหวัด'].isin(provinces)]
+    if years:df=df[df['ปีข้อมูลรายอำเภอ'].astype(str).str.contains('|'.join(years),regex=True)]
+    if df.empty:return 'ไม่พบข้อมูลรายอำเภอที่ตรงตามเงื่อนไขและปีที่ระบุครับ ลองถามโดยไม่กำหนดปี',None,'อำเภอ'
+    avail=df[df[DPROD].notna()]
+    nmissing=len(df)-len(avail)
+    text=f'**ข้อมูลรายอำเภอ {title_prov(provinces)} · {", ".join(crops)}** มีผลผลิตรายอำเภอ {len(avail)} จาก {len(df)} แถว; ยังไม่มีผลผลิตรายอำเภอ {nmissing} แถว\n\n'
+    if not avail.empty:
+        preview=avail[['อำเภอ','พืช','ปีข้อมูลรายอำเภอ',DPROD,'สถานะข้อมูลรายอำเภอ','แหล่งรายอำเภอ']].head(15)
+        for _,r in preview.iterrows():
+            text+=f'- **{r["อำเภอ"]}** · {r["พืช"]} · ปี {r["ปีข้อมูลรายอำเภอ"]}: **{fmt(r[DPROD])} ตัน** ({r["สถานะข้อมูลรายอำเภอ"]})\n'
     else:
-        display_table(all_issues, "data_quality")
-    st.markdown("**หลักการใช้ข้อมูล:** ใช้ปีเดียวกันก่อนจัดอันดับ · แยกค่าประมาณการจากข้อมูลรายงานจริง · ไม่บวกผลผลิตต่อไร่ · ตรวจสอบต้นฉบับก่อนใช้ราชการ")
-with source_tab:
-    level = st.radio("ชุดข้อมูล", [l for l, d in (("อำเภอ", district), ("จังหวัด", province)) if d is not None], horizontal=True)
-    raw = district if level == "อำเภอ" else province
-    st.caption(f"ข้อมูลระดับ{level} จำนวน {len(raw):,} รายการ")
-    display_table(add_explanation(raw, level), "source_data")
-    with st.expander("📘 ความหมายและข้อจำกัด"):
-        st.markdown("**ผลผลิตต่อไร่:** ค่าที่ขาดในฐานข้อมูลอำเภอเติมจากผลผลิตเฉลี่ยระดับจังหวัด สศก. โดยคัดค่าตามตารางอ้างอิง ไม่ใช่ค่าที่วัดรายอำเภอ · แสดงทศนิยม 2 ตำแหน่ง")
-        st.markdown("**ระดับจังหวัด:** ข้อมูลสรุประดับจังหวัดจากเอกสารอ้างอิง สศก.")
-        st.markdown("**ระดับอำเภอ:** บางรายการประมาณการจากพื้นที่เก็บเกี่ยวอำเภอ × ผลผลิตเฉลี่ยจังหวัด ไม่ใช่ค่าที่สำรวจผลผลิตจริงของอำเภอ")
+        text+='ยังไม่พบตัวเลขผลผลิตรายอำเภอที่ตรวจสอบได้จากไฟล์ต้นทาง **จึงไม่นำยอดจังหวัดมาแสดงเป็นผลผลิตรายอำเภอ**\n'
+    text+='\n📏 **ผลผลิตต่อไร่ในตารางอำเภอเป็นค่าเฉลี่ยระดับจังหวัดของ สศก. เพื่ออ้างอิงเท่านั้น** ไม่ใช่อัตราที่สำรวจจริงของอำเภอ'
+    return text,df[['จังหวัด','อำเภอ','พืช','ปีข้อมูลรายอำเภอ',DPROD,DAREA,'สถานะข้อมูลรายอำเภอ',REFYIELD,'ปีสถิติจังหวัด สศก.','อ้างอิง สศก.']],'อำเภอ'
+
+st.markdown('<div class="agri-hero"><h1>🌾 AgriData AI</h1><p>ถามข้อมูลการเกษตร 8 จังหวัด · แยกข้อมูลรายจังหวัดและรายอำเภออย่างชัดเจน · อ้างอิงย้อนกลับได้</p></div>',unsafe_allow_html=True)
+
+with st.container():
+    st.subheader('💬 ถามข้อมูลได้เลย')
+    st.caption('ตัวอย่าง: อุดร อ้อย · อุดรข้าว · มีข้อมูลหนองบัวไหม · อ้อยรายอำเภออุดร · ผลผลิตต่อไร่ข้าวนาปีขอนแก่น')
+    if 'agri_history' not in st.session_state:st.session_state['agri_history']=[]
+    with st.container(height=470,border=True):
+        for msg in st.session_state.agri_history:
+            with st.chat_message(msg['role']):
+                st.markdown(msg['content'])
+                if msg.get('table') is not None:
+                    st.dataframe(msg['table'],use_container_width=True,hide_index=True)
+        if not st.session_state.agri_history:
+            st.info('พิมพ์คำถามด้านล่างได้ทันที ระบบค้นตัวเลขจากฐานข้อมูลโดยตรง ไม่เดาผลผลิต')
+    with st.form('chat',clear_on_submit=True):
+        query=st.text_input('พิมพ์คำถามที่นี่',placeholder='เช่น อุดร อ้อย / ข้าวขอนแก่น / อ้อยรายอำเภออุดร')
+        c1,c2=st.columns([3,1]); send=c1.form_submit_button('➤ ส่งคำถาม',use_container_width=True)
+    if send and query.strip():
+        reply,table,level=respond(query.strip())
+        st.session_state.agri_history.extend([
+            {'role':'user','content':query.strip()},
+            {'role':'assistant','content':reply,'table':tidy_table(table,list(table.columns)) if table is not None else None}])
+        st.rerun()
+    if st.button('🧹 เริ่มบทสนทนาใหม่'):
+        st.session_state.agri_history=[]
+        st.session_state.agri_context={'provinces':[],'crops':[],'level':'จังหวัด','coverage':False}
+        st.rerun()
+
+st.divider()
+with st.container():
+    st.subheader('📏 Dashboard · ผลผลิตต่อไร่เป็นตัวชี้วัดหลัก')
+    st.caption('ตัวเลขระดับจังหวัดจากเอกสาร สศก. · ไม่ใช้ตัวเลขจังหวัดซ้ำในรายอำเภอ')
+    cols=st.columns([1.2,1.2,0.9])
+    crops=sorted(province['พืช'].unique().tolist())
+    crop=cols[0].selectbox('ชนิดพืช',crops,index=crops.index('อ้อยโรงงาน') if 'อ้อยโรงงาน' in crops else 0)
+    place=cols[1].selectbox('จังหวัด',['ทั้งหมด']+sorted(province['จังหวัด'].unique().tolist()))
+    dashboard_df=province[province['พืช']==crop].copy()
+    if place!='ทั้งหมด':dashboard_df=dashboard_df[dashboard_df['จังหวัด']==place]
+    years=sorted(dashboard_df['ปีสถิติ'].unique().tolist(),reverse=True)
+    year=cols[2].selectbox('ปีสถิติ',years) if years else None
+    if year is not None:dashboard_df=dashboard_df[dashboard_df['ปีสถิติ']==year].copy()
+    if dashboard_df.empty:
+        st.warning('ไม่มีข้อมูลตรงตามตัวกรอง')
+    else:
+        leader=dashboard_df.sort_values(YIELD,ascending=False).iloc[0]
+        a,b,c,d=st.columns(4)
+        a.metric(f'⭐ ผลผลิตต่อไร่สูงสุด · {leader["จังหวัด"]}',f'{leader[YIELD]:,.2f} กก./ไร่')
+        if len(dashboard_df)==1:
+            b.metric('ผลผลิตรวม',f'{dashboard_df[PROD].iloc[0]:,.2f} ตัน')
+            c.metric('พื้นที่เก็บเกี่ยว',f'{dashboard_df[AREA].iloc[0]:,.2f} ไร่')
+        else:
+            b.metric('จังหวัดในชุดเปรียบเทียบ',len(dashboard_df))
+            c.metric('ปีสถิติ',year)
+        d.metric('เอกสารอ้างอิง สศก.',f'{len(dashboard_df)} รายการ')
+        st.markdown('**อันดับผลผลิตต่อไร่รายจังหวัด (กก./ไร่)**')
+        st.bar_chart(dashboard_df.set_index('จังหวัด')[[YIELD]],use_container_width=True,horizontal=True)
+        st.markdown('**ผลผลิตรวม (ตัน)**')
+        st.bar_chart(dashboard_df.set_index('จังหวัด')[[PROD]],use_container_width=True,horizontal=True)
+        st.markdown('**พื้นที่เก็บเกี่ยว (ไร่)**')
+        st.bar_chart(dashboard_df.set_index('จังหวัด')[[AREA]],use_container_width=True,horizontal=True)
+        st.caption('ที่มา: สำนักงานเศรษฐกิจการเกษตร · '+', '.join(dashboard_df['อ้างอิงตาราง/หน้า'].unique()))
+        st.dataframe(tidy_table(dashboard_df,['จังหวัด','พืช','ปีสถิติ',PROD,AREA,YIELD,'อ้างอิงตาราง/หน้า','ลิงก์ สศก.']),use_container_width=True,hide_index=True)
+        st.download_button('⬇️ ดาวน์โหลดตารางจังหวัด CSV',data=as_csv(dashboard_df),file_name='agri_province_filtered.csv',mime='text/csv')
+
+st.divider()
+with st.expander('📚 ที่มาและตรวจสอบข้อมูลต้นทาง', expanded=False):
+    n_avail=int(district[DPROD].notna().sum())
+    p1,p2,p3=st.columns(3)
+    p1.metric('ข้อมูลจังหวัด สศก.',len(province))
+    p2.metric('มีตัวเลขผลผลิตรายอำเภอ',n_avail)
+    p3.metric('ยังไม่พบผลผลิตรายอำเภอ',len(district)-n_avail)
+    st.markdown('**ข้อควรทราบ:** ค่าเฉลี่ยผลผลิตต่อไร่ที่ปรากฏในข้อมูลรายอำเภอเป็น **ค่าเฉลี่ยจังหวัดของ สศก.** เพื่ออ้างอิง ไม่ใช่ตัวเลขผลผลิตต่อไร่ที่วัดระดับอำเภอ')
+    st.markdown('ตารางรายอำเภอที่ไม่พบตัวเลข จะเว้นว่าง ไม่ใช้ผลผลิตจังหวัดแทน และทุกแถวมีชื่อไฟล์/แท็บ/แถวต้นทางกำกับ')
+    with st.expander('ดูข้อมูลระดับจังหวัดจาก สศก.'):
+        st.dataframe(province,use_container_width=True,hide_index=True)
+    with st.expander('ดูข้อมูลระดับอำเภอครบ 590 แถว'):
+        st.dataframe(district,use_container_width=True,hide_index=True)
+    c1,c2=st.columns(2)
+    c1.download_button('ดาวน์โหลดข้อมูลจังหวัด CSV',as_csv(province),'province_data.csv',mime='text/csv')
+    c2.download_button('ดาวน์โหลดข้อมูลอำเภอ CSV',as_csv(district),'data.csv',mime='text/csv')
+
+st.caption('AgriData AI · จัดเรียงใหม่จาก Excel ต้นทาง 8 จังหวัด · ข้อมูลจากแหล่งอ้างอิงเดิม ไม่ใช่การตรวจยืนยัน PDF สศก. ฉบับจริงทุกตัวเลข')
